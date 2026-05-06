@@ -39,11 +39,21 @@ db.run(`
     cwd TEXT NOT NULL,
     git_root TEXT,
     tty TEXT,
+    profile TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migrate existing databases: add `profile` column if missing.
+// SQLite doesn't support `ADD COLUMN IF NOT EXISTS`, so we probe pragma_table_info.
+{
+  const cols = db.query("PRAGMA table_info(peers)").all() as { name: string }[];
+  if (!cols.some((c) => c.name === "profile")) {
+    db.run("ALTER TABLE peers ADD COLUMN profile TEXT NOT NULL DEFAULT ''");
+  }
+}
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -81,8 +91,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -145,7 +155,17 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(
+    id,
+    body.pid,
+    body.cwd,
+    body.git_root,
+    body.tty,
+    body.profile ?? "",
+    body.summary,
+    now,
+    now,
+  );
   return { id };
 }
 

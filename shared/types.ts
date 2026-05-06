@@ -7,6 +7,7 @@ export interface Peer {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  profile: string; // iTerm2 dynamic-profile name (from ITERM_PROFILE env), "" if unset
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -28,6 +29,7 @@ export interface RegisterRequest {
   cwd: string;
   git_root: string | null;
   tty: string | null;
+  profile: string;
   summary: string;
 }
 

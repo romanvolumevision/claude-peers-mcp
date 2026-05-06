@@ -268,6 +268,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           ];
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
+          if (p.profile) parts.push(`Profile: ${p.profile}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
           parts.push(`Last seen: ${p.last_seen}`);
           return parts.join("\n  ");
@@ -458,10 +459,14 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
+  // ITERM_PROFILE is set automatically by iTerm2 to the dynamic-profile name
+  // (e.g. "Blue Shadow"). Empty string for non-iTerm callers.
+  const profile = process.env.ITERM_PROFILE ?? "";
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
+  log(`Profile: ${profile || "(unset)"}`);
 
   // 3. Generate initial summary via gpt-5.4-nano (non-blocking, best-effort)
   let initialSummary = "";
@@ -493,6 +498,7 @@ async function main() {
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
+    profile,
     summary: initialSummary,
   });
   myId = reg.id;

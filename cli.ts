@@ -49,6 +49,7 @@ switch (cmd) {
             cwd: string;
             git_root: string | null;
             tty: string | null;
+            profile: string;
             summary: string;
             last_seen: string;
           }>
@@ -63,6 +64,7 @@ switch (cmd) {
           console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
           if (p.summary) console.log(`         ${p.summary}`);
           if (p.tty) console.log(`         TTY: ${p.tty}`);
+          if (p.profile) console.log(`         Profile: ${p.profile}`);
           console.log(`         Last seen: ${p.last_seen}`);
         }
       }
