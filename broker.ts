@@ -17,6 +17,8 @@ import type {
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
+  KillPeerRequest,
+  KillPeerResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
@@ -228,6 +230,45 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+const ALLOWED_KILL_SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
+
+function dropPeer(id: string): void {
+  deletePeer.run(id);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+}
+
+function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
+  const peer = db.query("SELECT id, pid FROM peers WHERE id = ?").get(body.to_id) as
+    | { id: string; pid: number }
+    | null;
+  if (!peer) {
+    return { ok: false, error: `Peer ${body.to_id} not found` };
+  }
+  const signal = body.signal ?? "SIGTERM";
+  if (!ALLOWED_KILL_SIGNALS.has(signal)) {
+    return { ok: false, error: `Unsupported signal ${signal} (allowed: SIGTERM, SIGKILL, SIGINT)` };
+  }
+  try {
+    process.kill(peer.pid, signal as NodeJS.Signals);
+  } catch (e) {
+    const code = (e as { code?: string })?.code;
+    if (code === "ESRCH") {
+      // Process is already gone — clean up the stale row and report success.
+      dropPeer(peer.id);
+      return { ok: true, pid: peer.pid, error: "process already exited (stale peer cleaned)" };
+    }
+    return {
+      ok: false,
+      error: `kill(${peer.pid}, ${signal}) failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  // Drop the peer so it disappears from list-peers immediately; the target's
+  // own SIGTERM handler also calls /unregister (a no-op if we win the race).
+  dropPeer(peer.id);
+  console.error(`[claude-peers broker] kill ${peer.id} (pid ${peer.pid}, ${signal}) by ${body.from_id ?? "?"}`);
+  return { ok: true, pid: peer.pid };
+}
+
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
 
@@ -275,6 +316,8 @@ Bun.serve({
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(body as SendMessageRequest));
+        case "/kill-peer":
+          return Response.json(handleKillPeer(body as KillPeerRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/unregister":

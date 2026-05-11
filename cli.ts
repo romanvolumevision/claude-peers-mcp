@@ -8,6 +8,7 @@
  *   bun cli.ts status          — Show broker status and all peers
  *   bun cli.ts peers           — List all peers
  *   bun cli.ts send <id> <msg> — Send a message to a peer
+ *   bun cli.ts kill <id> [sig] — Terminate a peer (default SIGTERM)
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
@@ -131,6 +132,31 @@ switch (cmd) {
     break;
   }
 
+  case "kill": {
+    const toId = process.argv[3];
+    const signal = process.argv[4];
+    if (!toId) {
+      console.error("Usage: bun cli.ts kill <peer-id> [SIGTERM|SIGKILL|SIGINT]");
+      process.exit(1);
+    }
+    try {
+      const result = await brokerFetch<{ ok: boolean; error?: string; pid?: number }>("/kill-peer", {
+        from_id: "cli",
+        to_id: toId,
+        signal,
+      });
+      if (result.ok) {
+        const note = result.error ? ` (${result.error})` : "";
+        console.log(`Sent ${signal ?? "SIGTERM"} to ${toId} (pid ${result.pid})${note}`);
+      } else {
+        console.error(`Failed: ${result.error}`);
+      }
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -159,5 +185,6 @@ Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
   bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts kill <id> [sig] Terminate a peer (default SIGTERM)
   bun cli.ts kill-broker     Stop the broker daemon`);
 }

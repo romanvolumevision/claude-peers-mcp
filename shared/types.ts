@@ -60,6 +60,21 @@ export interface SendMessageRequest {
   text: string;
 }
 
+// Remote peer-terminate. The broker looks the peer up by id, sends `signal`
+// (default SIGTERM) to its PID, and drops the row so it leaves list-peers
+// immediately. `from_id` is advisory (audit/log only).
+export interface KillPeerRequest {
+  from_id?: PeerId;
+  to_id: PeerId;
+  signal?: "SIGTERM" | "SIGKILL" | "SIGINT";
+}
+
+export interface KillPeerResponse {
+  ok: boolean;
+  error?: string;
+  pid?: number;
+}
+
 export interface PollMessagesRequest {
   id: PeerId;
 }
