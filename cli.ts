@@ -8,20 +8,34 @@
  *   bun cli.ts status          — Show broker status and all peers
  *   bun cli.ts peers           — List all peers
  *   bun cli.ts send <id> <msg> — Send a message to a peer
+ *   bun cli.ts kill <id> [sig] — Terminate a peer (default SIGTERM)
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
+import { sign } from "./auth";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 
+/**
+ * Phase 0 broker-auth-substrate (CONV-9671 T0.7): signs outbound POSTs with
+ * HMAC headers when CLAUDE_PEERS_HMAC_SECRET is set. Backwards-compatible
+ * when env-var is unset.
+ */
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
-  const opts: RequestInit = body
-    ? {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    : {};
+  let opts: RequestInit = {};
+  if (body !== undefined) {
+    const bodyStr = JSON.stringify(body);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (HMAC_SECRET) {
+      const ts = Math.floor(Date.now() / 1000);
+      headers["X-Claude-Peers-Auth"] = sign(bodyStr, ts, HMAC_SECRET);
+      headers["X-Claude-Peers-Timestamp"] = String(ts);
+      headers["X-Claude-Peers-Session-Anchor"] = "";  // Phase 0 stub
+    }
+    opts = { method: "POST", headers, body: bodyStr };
+  }
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
     signal: AbortSignal.timeout(3000),
@@ -131,6 +145,31 @@ switch (cmd) {
     break;
   }
 
+  case "kill": {
+    const toId = process.argv[3];
+    const signal = process.argv[4];
+    if (!toId) {
+      console.error("Usage: bun cli.ts kill <peer-id> [SIGTERM|SIGKILL|SIGINT]");
+      process.exit(1);
+    }
+    try {
+      const result = await brokerFetch<{ ok: boolean; error?: string; pid?: number }>("/kill-peer", {
+        from_id: "cli",
+        to_id: toId,
+        signal,
+      });
+      if (result.ok) {
+        const note = result.error ? ` (${result.error})` : "";
+        console.log(`Sent ${signal ?? "SIGTERM"} to ${toId} (pid ${result.pid})${note}`);
+      } else {
+        console.error(`Failed: ${result.error}`);
+      }
+    } catch (e) {
+      console.error(`Error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -159,5 +198,6 @@ Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
   bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts kill <id> [sig] Terminate a peer (default SIGTERM)
   bun cli.ts kill-broker     Stop the broker daemon`);
 }

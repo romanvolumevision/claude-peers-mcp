@@ -23,6 +23,7 @@ import type {
   PeerId,
   Peer,
   RegisterResponse,
+  KillPeerResponse,
   PollMessagesResponse,
   Message,
 } from "./shared/types.ts";
@@ -34,19 +35,37 @@ import {
 
 // --- Configuration ---
 
+import { sign } from "./auth";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
 // --- Broker communication ---
 
+/**
+ * Phase 0 broker-auth-substrate (CONV-9671 T0.7): signs outbound POSTs with
+ * HMAC headers when CLAUDE_PEERS_HMAC_SECRET is set. Backwards-compatible
+ * when env-var is unset (no headers added; broker accepts in warn mode,
+ * rejects in enforce mode).
+ */
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  const bodyStr = JSON.stringify(body);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (HMAC_SECRET) {
+    const ts = Math.floor(Date.now() / 1000);
+    headers["X-Claude-Peers-Auth"] = sign(bodyStr, ts, HMAC_SECRET);
+    headers["X-Claude-Peers-Timestamp"] = String(ts);
+    // Phase 0 stub — Phase 1+ will populate from caller's session_anchor.
+    headers["X-Claude-Peers-Session-Anchor"] = "";
+  }
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers,
+    body: bodyStr,
   });
   if (!res.ok) {
     const err = await res.text();
@@ -159,6 +178,7 @@ Available tools:
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
+- kill_peer: Terminate another instance by ID (sends SIGTERM, or SIGKILL/SIGINT). Use sparingly — this kills the target process. Prefer send_message with a "please stop" / session.pause envelope first; reserve kill_peer for an unresponsive peer or an orchestrator-level emergency stop.
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -225,6 +245,27 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {},
+    },
+  },
+  {
+    name: "kill_peer",
+    description:
+      "Terminate another Claude Code instance by peer ID. Sends a signal (default SIGTERM) to the target's process. Use sparingly: prefer send_message with a 'please stop' / session.pause request first, and reserve this for an unresponsive peer or an orchestrator-level emergency stop. The target leaves list_peers immediately on success.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        to_id: {
+          type: "string" as const,
+          description: "The peer ID of the target Claude Code instance (from list_peers)",
+        },
+        signal: {
+          type: "string" as const,
+          enum: ["SIGTERM", "SIGKILL", "SIGINT"],
+          description:
+            "Signal to send (default SIGTERM — lets the target unregister + exit cleanly). Use SIGKILL only if SIGTERM did not work.",
+        },
+      },
+      required: ["to_id"],
     },
   },
 ];
@@ -388,6 +429,54 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "kill_peer": {
+      const { to_id, signal } = args as { to_id: string; signal?: "SIGTERM" | "SIGKILL" | "SIGINT" };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      if (to_id === myId) {
+        return {
+          content: [{ type: "text" as const, text: "Refusing to kill_peer myself — exit normally instead." }],
+          isError: true,
+        };
+      }
+      try {
+        const result = await brokerFetch<KillPeerResponse>("/kill-peer", {
+          from_id: myId,
+          to_id,
+          signal,
+        });
+        if (!result.ok) {
+          return {
+            content: [{ type: "text" as const, text: `Failed to kill peer ${to_id}: ${result.error}` }],
+            isError: true,
+          };
+        }
+        const note = result.error ? ` (${result.error})` : "";
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Sent ${signal ?? "SIGTERM"} to peer ${to_id} (pid ${result.pid})${note}.`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error killing peer: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,

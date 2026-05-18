@@ -7,6 +7,20 @@
  *
  * Auto-launched by the MCP server if not already running.
  * Run directly: bun broker.ts
+ *
+ * Phase 0 broker-auth-substrate additions (Atlas #2904, CONV-9671):
+ *   - Bind-host configurable via CLAUDE_PEERS_BIND_HOST env-var
+ *     (default 127.0.0.1; unblocks tunnel-accessible interface for
+ *     Phase 2 Sergei tunnel without affecting localhost-only deployments).
+ *   - HMAC-based authentication middleware. Mode controlled by
+ *     BROKER_HMAC_MODE env-var: "off" (no auth, no emits), "warn"
+ *     (accept all + emit auth_skipped/auth_success — default), or
+ *     "enforce" (reject unsigned with 401 + emit auth_failure).
+ *   - Audit emissions go via the aggregator-relay endpoint at
+ *     http://127.0.0.1:7901/broker-audit-relay (extension of
+ *     scripts/lib/peers_aggregator.py — see guppi workstream T0.5
+ *     amendment + Atlas #3058). Fail-open: any relay failure swallows
+ *     to console.error to avoid blocking broker requests.
  */
 
 import { Database } from "bun:sqlite";
@@ -17,14 +31,26 @@ import type {
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
+  KillPeerRequest,
+  KillPeerResponse,
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
   Message,
 } from "./shared/types.ts";
+import { verify } from "./auth";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
+const BIND_HOST = process.env.CLAUDE_PEERS_BIND_HOST ?? "127.0.0.1";
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
+const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
+type HmacMode = "off" | "warn" | "enforce";
+const HMAC_MODE: HmacMode = ((): HmacMode => {
+  const raw = (process.env.BROKER_HMAC_MODE ?? "warn").toLowerCase();
+  return raw === "off" || raw === "enforce" ? raw : "warn";
+})();
+const AGGREGATOR_RELAY_URL =
+  process.env.GUPPI_BROKER_AUDIT_RELAY_URL ?? "http://127.0.0.1:7901/broker-audit-relay";
 
 // --- Database setup ---
 
@@ -228,6 +254,45 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   return { ok: true };
 }
 
+const ALLOWED_KILL_SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
+
+function dropPeer(id: string): void {
+  deletePeer.run(id);
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+}
+
+function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
+  const peer = db.query("SELECT id, pid FROM peers WHERE id = ?").get(body.to_id) as
+    | { id: string; pid: number }
+    | null;
+  if (!peer) {
+    return { ok: false, error: `Peer ${body.to_id} not found` };
+  }
+  const signal = body.signal ?? "SIGTERM";
+  if (!ALLOWED_KILL_SIGNALS.has(signal)) {
+    return { ok: false, error: `Unsupported signal ${signal} (allowed: SIGTERM, SIGKILL, SIGINT)` };
+  }
+  try {
+    process.kill(peer.pid, signal as NodeJS.Signals);
+  } catch (e) {
+    const code = (e as { code?: string })?.code;
+    if (code === "ESRCH") {
+      // Process is already gone — clean up the stale row and report success.
+      dropPeer(peer.id);
+      return { ok: true, pid: peer.pid, error: "process already exited (stale peer cleaned)" };
+    }
+    return {
+      ok: false,
+      error: `kill(${peer.pid}, ${signal}) failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+  // Drop the peer so it disappears from list-peers immediately; the target's
+  // own SIGTERM handler also calls /unregister (a no-op if we win the race).
+  dropPeer(peer.id);
+  console.error(`[claude-peers broker] kill ${peer.id} (pid ${peer.pid}, ${signal}) by ${body.from_id ?? "?"}`);
+  return { ok: true, pid: peer.pid };
+}
+
 function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
   const messages = selectUndelivered.all(body.id) as Message[];
 
@@ -243,24 +308,134 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- Phase 0 audit emit (aggregator-relay) ---
+//
+// broker.ts is dependency-free (stdlib only — node:crypto + bun:sqlite +
+// bun:test in tests). Audit rows are POSTed to the guppi aggregator's
+// /broker-audit-relay endpoint, which forwards to Supabase via the
+// shared.audit_envelope.log_event_envelope primitive (T0.5 amended per
+// CONV-9671 GAP-4; sibling Atlas #3058).
+//
+// Fail-open: any relay failure swallows to console.error. Audit gaps
+// during PR-A-only-deployed window (before PR-B ships /broker-audit-relay
+// endpoint) are intentional — Phase 0 default HMAC_MODE is "warn" so the
+// gap is observable but non-blocking.
+function emitAudit(actionType: string, context: Record<string, unknown>, convId?: string): void {
+  const envelope = {
+    script: "claude_peers_broker",
+    action_type: actionType,
+    conv_id: convId ?? null,
+    details_envelope: {
+      timestamp: new Date().toISOString(),
+      context,
+    },
+  };
+  // Fire-and-forget; do NOT await (would block broker request handling).
+  fetch(AGGREGATOR_RELAY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(envelope),
+    signal: AbortSignal.timeout(500),
+  }).catch((e) => {
+    console.error(`[claude-peers broker] audit relay failed: ${e instanceof Error ? e.message : String(e)}`);
+  });
+}
+
+// --- Phase 0 HMAC middleware ---
+//
+// Returns null when the request is authenticated (or in "off"/"warn"
+// mode with no secret configured). Returns a Response when the request
+// should be short-circuited (401 in "enforce" mode + missing/invalid sig).
+//
+// Side effect: emits one of auth_failure / auth_success / auth_skipped per
+// the workstream T0.5 substrate. The caller passes the raw body text so
+// verify() can run against the same bytes the broker handler will consume.
+function applyHmacMiddleware(
+  req: Request,
+  path: string,
+  rawBody: string,
+): Response | null {
+  if (HMAC_MODE === "off") {
+    return null;
+  }
+
+  const sig = req.headers.get("X-Claude-Peers-Auth") ?? "";
+  const tsRaw = req.headers.get("X-Claude-Peers-Timestamp") ?? "";
+  const anchor = req.headers.get("X-Claude-Peers-Session-Anchor") ?? "";
+  const remote = req.headers.get("X-Forwarded-For") ?? "local";
+
+  if (!sig || !tsRaw) {
+    // Unsigned request.
+    if (HMAC_MODE === "enforce") {
+      emitAudit("auth_failure", { path, reason: "missing", remote, session_anchor: anchor });
+      return Response.json({ error: "missing X-Claude-Peers-Auth or X-Claude-Peers-Timestamp" }, { status: 401 });
+    }
+    // warn mode — accept and observe.
+    emitAudit("auth_skipped", { path, reason: "unsigned", remote, session_anchor: anchor });
+    return null;
+  }
+
+  const ts = parseInt(tsRaw, 10);
+  if (!Number.isFinite(ts)) {
+    if (HMAC_MODE === "enforce") {
+      emitAudit("auth_failure", { path, reason: "malformed_timestamp", remote, session_anchor: anchor });
+      return Response.json({ error: "malformed X-Claude-Peers-Timestamp" }, { status: 401 });
+    }
+    emitAudit("auth_skipped", { path, reason: "malformed_timestamp", remote, session_anchor: anchor });
+    return null;
+  }
+
+  if (!HMAC_SECRET) {
+    // No secret configured — fail closed in enforce mode, warn-emit otherwise.
+    if (HMAC_MODE === "enforce") {
+      emitAudit("auth_failure", { path, reason: "no_secret_configured", remote, session_anchor: anchor });
+      return Response.json({ error: "broker HMAC secret not configured" }, { status: 401 });
+    }
+    emitAudit("auth_skipped", { path, reason: "no_secret_configured", remote, session_anchor: anchor });
+    return null;
+  }
+
+  if (verify(sig, rawBody, ts, HMAC_SECRET)) {
+    emitAudit("auth_success", { path, remote, session_anchor: anchor });
+    return null;
+  }
+
+  // Verification failed.
+  if (HMAC_MODE === "enforce") {
+    emitAudit("auth_failure", { path, reason: "invalid_signature", remote, session_anchor: anchor });
+    return Response.json({ error: "invalid HMAC signature or expired timestamp" }, { status: 401 });
+  }
+  emitAudit("auth_skipped", { path, reason: "invalid_signature_warn_mode", remote, session_anchor: anchor });
+  return null;
+}
+
 // --- HTTP Server ---
 
 Bun.serve({
   port: PORT,
-  hostname: "127.0.0.1",
+  hostname: BIND_HOST,
   async fetch(req) {
     const url = new URL(req.url);
     const path = url.pathname;
 
     if (req.method !== "POST") {
       if (path === "/health") {
+        // /health stays unauthenticated for tunnel + launchd health checks.
         return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
       }
       return new Response("claude-peers broker", { status: 200 });
     }
 
     try {
-      const body = await req.json();
+      // Read raw body text BEFORE JSON.parse so HMAC verification has the
+      // same bytes the signer used. Subsequent JSON.parse picks the same
+      // string up.
+      const rawBody = await req.text();
+      const authRejection = applyHmacMiddleware(req, path, rawBody);
+      if (authRejection) {
+        return authRejection;
+      }
+      const body = JSON.parse(rawBody);
 
       switch (path) {
         case "/register":
@@ -275,6 +450,8 @@ Bun.serve({
           return Response.json(handleListPeers(body as ListPeersRequest));
         case "/send-message":
           return Response.json(handleSendMessage(body as SendMessageRequest));
+        case "/kill-peer":
+          return Response.json(handleKillPeer(body as KillPeerRequest));
         case "/poll-messages":
           return Response.json(handlePollMessages(body as PollMessagesRequest));
         case "/unregister":
@@ -290,4 +467,7 @@ Bun.serve({
   },
 });
 
-console.error(`[claude-peers broker] listening on 127.0.0.1:${PORT} (db: ${DB_PATH})`);
+console.error(
+  `[claude-peers broker] listening on ${BIND_HOST}:${PORT} ` +
+    `(db: ${DB_PATH}, hmac_mode: ${HMAC_MODE})`,
+);
