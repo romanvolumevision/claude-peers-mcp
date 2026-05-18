@@ -12,17 +12,30 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
+import { sign } from "./auth";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 
+/**
+ * Phase 0 broker-auth-substrate (CONV-9671 T0.7): signs outbound POSTs with
+ * HMAC headers when CLAUDE_PEERS_HMAC_SECRET is set. Backwards-compatible
+ * when env-var is unset.
+ */
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
-  const opts: RequestInit = body
-    ? {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      }
-    : {};
+  let opts: RequestInit = {};
+  if (body !== undefined) {
+    const bodyStr = JSON.stringify(body);
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (HMAC_SECRET) {
+      const ts = Math.floor(Date.now() / 1000);
+      headers["X-Claude-Peers-Auth"] = sign(bodyStr, ts, HMAC_SECRET);
+      headers["X-Claude-Peers-Timestamp"] = String(ts);
+      headers["X-Claude-Peers-Session-Anchor"] = "";  // Phase 0 stub
+    }
+    opts = { method: "POST", headers, body: bodyStr };
+  }
   const res = await fetch(`${BROKER_URL}${path}`, {
     ...opts,
     signal: AbortSignal.timeout(3000),

@@ -35,19 +35,37 @@ import {
 
 // --- Configuration ---
 
+import { sign } from "./auth";
+
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
 // --- Broker communication ---
 
+/**
+ * Phase 0 broker-auth-substrate (CONV-9671 T0.7): signs outbound POSTs with
+ * HMAC headers when CLAUDE_PEERS_HMAC_SECRET is set. Backwards-compatible
+ * when env-var is unset (no headers added; broker accepts in warn mode,
+ * rejects in enforce mode).
+ */
 async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+  const bodyStr = JSON.stringify(body);
+  const headers: Record<string, string> = { "Content-Type": "application/json" };
+  if (HMAC_SECRET) {
+    const ts = Math.floor(Date.now() / 1000);
+    headers["X-Claude-Peers-Auth"] = sign(bodyStr, ts, HMAC_SECRET);
+    headers["X-Claude-Peers-Timestamp"] = String(ts);
+    // Phase 0 stub — Phase 1+ will populate from caller's session_anchor.
+    headers["X-Claude-Peers-Session-Anchor"] = "";
+  }
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
+    headers,
+    body: bodyStr,
   });
   if (!res.ok) {
     const err = await res.text();
