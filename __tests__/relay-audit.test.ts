@@ -93,21 +93,21 @@ describe("buildRelayAuditHeaders", () => {
   test("signature verifies via auth.verify round-trip", () => {
     const ts = Math.floor(Date.now() / 1000);
     const headers = buildRelayAuditHeaders(BODY, { secret: SECRET, ts });
-    const sig = headers!["X-Claude-Peers-Auth"];
+    const sig = headers!["X-Claude-Peers-Auth"]!;
     expect(verify(sig, BODY, ts, SECRET)).toBe(true);
   });
 
   test("signature does NOT verify with wrong secret", () => {
     const ts = Math.floor(Date.now() / 1000);
     const headers = buildRelayAuditHeaders(BODY, { secret: SECRET, ts });
-    const sig = headers!["X-Claude-Peers-Auth"];
+    const sig = headers!["X-Claude-Peers-Auth"]!;
     expect(verify(sig, BODY, ts, "different-secret")).toBe(false);
   });
 
   test("signature does NOT verify if body is tampered", () => {
     const ts = Math.floor(Date.now() / 1000);
     const headers = buildRelayAuditHeaders(BODY, { secret: SECRET, ts });
-    const sig = headers!["X-Claude-Peers-Auth"];
+    const sig = headers!["X-Claude-Peers-Auth"]!;
     expect(verify(sig, BODY + "tamper", ts, SECRET)).toBe(false);
   });
 
@@ -115,7 +115,7 @@ describe("buildRelayAuditHeaders", () => {
     const before = Math.floor(Date.now() / 1000);
     const headers = buildRelayAuditHeaders(BODY, { secret: SECRET });
     const after = Math.floor(Date.now() / 1000);
-    const ts = parseInt(headers!["X-Claude-Peers-Timestamp"], 10);
+    const ts = parseInt(headers!["X-Claude-Peers-Timestamp"]!, 10);
     expect(ts).toBeGreaterThanOrEqual(before);
     expect(ts).toBeLessThanOrEqual(after);
   });
