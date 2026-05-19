@@ -18,7 +18,7 @@
  * Operators flip ON once PR-B (guppi /broker-audit-relay endpoint) is
  * deployed AND CLAUDE_PEERS_HMAC_SECRET is provisioned.
  *
- * Truthy values (case-insensitive): "1", "true", "yes", "on".
+ * Truthy values (case-insensitive, whitespace-trimmed): "1", "true", "yes", "on".
  *
  * Cross-references:
  *   - Atlas #3136 (cross-repo HMAC sign on relay POST)
@@ -28,7 +28,18 @@
  *   - origin: Pink CONV-9989 2026-05-19.
  */
 
+import { sign } from "./auth";
+
 export const RELAY_AUDIT_FLAG_ENV = "CLAUDE_PEERS_RELAY_AUDIT_ENABLED";
+
+const TRUTHY = new Set(["1", "true", "yes", "on"]);
+
+export function relayAuditEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = (env[RELAY_AUDIT_FLAG_ENV] ?? "").trim().toLowerCase();
+  return TRUTHY.has(raw);
+}
 
 export interface BuildRelayAuditHeadersOpts {
   ts?: number;
@@ -36,17 +47,19 @@ export interface BuildRelayAuditHeadersOpts {
   sessionAnchor?: string;
 }
 
-export function relayAuditEnabled(
-  _env: Record<string, string | undefined> = process.env,
-): boolean {
-  // STUB — Atlas #3136 implementation pending (RED commit).
-  return false;
-}
-
 export function buildRelayAuditHeaders(
-  _rawBody: string,
-  _opts: BuildRelayAuditHeadersOpts = {},
+  rawBody: string,
+  opts: BuildRelayAuditHeadersOpts = {},
 ): Record<string, string> | null {
-  // STUB — Atlas #3136 implementation pending (RED commit).
-  return null;
+  const secret = opts.secret ?? "";
+  if (!secret) {
+    return null;
+  }
+  const ts = opts.ts ?? Math.floor(Date.now() / 1000);
+  return {
+    "Content-Type": "application/json",
+    "X-Claude-Peers-Auth": sign(rawBody, ts, secret),
+    "X-Claude-Peers-Timestamp": String(ts),
+    "X-Claude-Peers-Session-Anchor": opts.sessionAnchor ?? "",
+  };
 }
