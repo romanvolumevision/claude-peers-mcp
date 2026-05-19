@@ -107,11 +107,12 @@ bun cli.ts kill-broker       # stop the broker
 
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| Environment variable                | Default              | Description                                                                                                                                                                              |
+| ----------------------------------- | -------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CLAUDE_PEERS_PORT`                 | `7899`               | Broker port                                                                                                                                                                              |
+| `CLAUDE_PEERS_DB`                   | `~/.claude-peers.db` | SQLite database path                                                                                                                                                                     |
+| `OPENAI_API_KEY`                    | —                    | Enables auto-summary via gpt-5.4-nano                                                                                                                                                    |
+| `CLAUDE_PEERS_RELAY_AUDIT_ENABLED` | `0` (off)            | When truthy (`1`/`true`/`yes`/`on`, case-insensitive), the broker POSTs HMAC-signed audit envelopes to the guppi `/broker-audit-relay` receiver. Default-off until the receiver is deployed AND `CLAUDE_PEERS_HMAC_SECRET` is provisioned (Atlas #3136 / PR-A-FOLLOWUP-1). |
 
 ## Requirements
 
