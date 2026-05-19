@@ -21,6 +21,15 @@
  *     scripts/lib/peers_aggregator.py — see guppi workstream T0.5
  *     amendment + Atlas #3058). Fail-open: any relay failure swallows
  *     to console.error to avoid blocking broker requests.
+ *
+ * Atlas #3136 (PR-A-FOLLOWUP-1, CONV-9989) — relay POST hardening:
+ *   - emitAudit signs every outbound relay POST via auth.sign (mirroring
+ *     server.ts brokerFetch HMAC pattern, c7e96b1).
+ *   - The emit is gated by CLAUDE_PEERS_RELAY_AUDIT_ENABLED (default-off)
+ *     so PR-A ships solo without flooding /broker-audit-relay 401s
+ *     during the PR-B gap window. Operators flip ON once PR-B (guppi
+ *     consumer-side HMAC verify) is deployed AND CLAUDE_PEERS_HMAC_SECRET
+ *     is provisioned. See relay-audit.ts for flag semantics.
  */
 
 import { Database } from "bun:sqlite";
@@ -39,6 +48,11 @@ import type {
   Message,
 } from "./shared/types.ts";
 import { verify } from "./auth";
+import {
+  RELAY_AUDIT_FLAG_ENV,
+  relayAuditEnabled,
+  buildRelayAuditHeaders,
+} from "./relay-audit";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BIND_HOST = process.env.CLAUDE_PEERS_BIND_HOST ?? "127.0.0.1";
@@ -316,11 +330,21 @@ function handleUnregister(body: { id: string }): void {
 // shared.audit_envelope.log_event_envelope primitive (T0.5 amended per
 // CONV-9671 GAP-4; sibling Atlas #3058).
 //
-// Fail-open: any relay failure swallows to console.error. Audit gaps
-// during PR-A-only-deployed window (before PR-B ships /broker-audit-relay
-// endpoint) are intentional — Phase 0 default HMAC_MODE is "warn" so the
-// gap is observable but non-blocking.
+// Atlas #3136 (PR-A-FOLLOWUP-1) hardening:
+//   - Default-off via CLAUDE_PEERS_RELAY_AUDIT_ENABLED — gate the emit
+//     entirely during the PR-B gap window so PR-A solo-deploy doesn't
+//     flood 401s against an unready receiver. Flip ON once both sides
+//     are ready + CLAUDE_PEERS_HMAC_SECRET is provisioned.
+//   - When enabled, every relay POST is HMAC-signed via buildRelayAuditHeaders
+//     so the guppi receiver (enforce-mode verify pipeline) accepts it cleanly.
+//
+// Fail-open: any relay failure or missing-secret skip swallows to
+// console.error.
 function emitAudit(actionType: string, context: Record<string, unknown>, convId?: string): void {
+  if (!relayAuditEnabled()) {
+    // Default-off — no relay attempted. Removes the PR-B gap-window 401 flood.
+    return;
+  }
   const envelope = {
     script: "claude_peers_broker",
     action_type: actionType,
@@ -330,11 +354,19 @@ function emitAudit(actionType: string, context: Record<string, unknown>, convId?
       context,
     },
   };
+  const rawBody = JSON.stringify(envelope);
+  const headers = buildRelayAuditHeaders(rawBody, { secret: HMAC_SECRET });
+  if (!headers) {
+    console.error(
+      `[claude-peers broker] audit relay skipped: ${RELAY_AUDIT_FLAG_ENV} is on but CLAUDE_PEERS_HMAC_SECRET is unset`,
+    );
+    return;
+  }
   // Fire-and-forget; do NOT await (would block broker request handling).
   fetch(AGGREGATOR_RELAY_URL, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(envelope),
+    headers,
+    body: rawBody,
     signal: AbortSignal.timeout(500),
   }).catch((e) => {
     console.error(`[claude-peers broker] audit relay failed: ${e instanceof Error ? e.message : String(e)}`);
