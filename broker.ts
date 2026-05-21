@@ -307,14 +307,23 @@ function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
   return { ok: true, pid: peer.pid };
 }
 
-function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
+function handlePollMessages(body: PollMessagesRequest, url: URL): PollMessagesResponse {
+  // ?ack-only=<truthy> → peek-only: return undelivered messages but do NOT
+  // mark them delivered (idempotent peek). Absent/falsy → existing atomic
+  // peek+mark-delivered behaviour (unchanged).
+  const ackOnlyRaw = (url.searchParams.get("ack-only") ?? "").toLowerCase();
+  const ackOnly = ackOnlyRaw === "true" || ackOnlyRaw === "1" || ackOnlyRaw === "yes" || ackOnlyRaw === "on";
   const messages = selectUndelivered.all(body.id) as Message[];
-
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  if (!ackOnly) {
+    for (const msg of messages) {
+      markDelivered.run(msg.id);
+    }
   }
-
+  emitAudit("claude_peers_broker_poll_invoked", {
+    peer_id: body.id,
+    mode: ackOnly ? "peek_only" : "atomic",
+    returned_count: messages.length,
+  });
   return { messages };
 }
 
@@ -485,7 +494,7 @@ Bun.serve({
         case "/kill-peer":
           return Response.json(handleKillPeer(body as KillPeerRequest));
         case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
+          return Response.json(handlePollMessages(body as PollMessagesRequest, url));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
