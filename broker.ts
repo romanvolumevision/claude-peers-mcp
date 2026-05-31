@@ -53,6 +53,7 @@ import {
   relayAuditEnabled,
   buildRelayAuditHeaders,
 } from "./relay-audit";
+import { stampPeerIdFile } from "./shared/stamp";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BIND_HOST = process.env.CLAUDE_PEERS_BIND_HOST ?? "127.0.0.1";
@@ -206,6 +207,12 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     now,
     now,
   );
+  // CONV-10613: pid-keyed peer-id marker backstop. server.ts also stamps from
+  // inside the spawned session (the authoritative writer); this broker-side
+  // write is belt-and-suspenders so the marker exists even if the session's
+  // own stamp races or is skipped. Idempotent — same filename + format, so a
+  // later server.ts overwrite is harmless. Best-effort; never blocks register.
+  stampPeerIdFile(body.pid, id, body.profile ?? "");
   return { id };
 }
 
