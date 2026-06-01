@@ -36,6 +36,10 @@ import {
 // --- Configuration ---
 
 import { sign } from "./auth";
+import * as fs from "fs";
+import * as path from "path";
+import { stampPeerIdFile } from "./shared/stamp";
+import { composeTabTitle, profileToChannel } from "./shared/tabtitle";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -115,6 +119,96 @@ async function ensureBroker(): Promise<void> {
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
   console.error(`[claude-peers] ${msg}`);
+}
+
+// --- Self-identity stamp + auto-tab-naming (CONV-10613) ---
+//
+// Root problem fixed: a session cannot see its own peer_id — the broker
+// excludes self from list_peers and never echoes own from_id. We close that by
+// writing the broker-assigned id where the session can read it back:
+//   * the GUPPI_PEER_ID env var on this process (visible to child shells), and
+//   * a pid-keyed marker file ~/.guppi/sessions/<pid>.peerid.
+//
+// Keyed by process.pid rather than a claude_session_id because no session-id
+// source exists in this MCP; pid is available everywhere the stamp is written
+// (server.ts self-register here, and broker.ts via body.pid).
+//
+// composeTabTitle / profileToChannel live in shared/tabtitle.ts (unit-testable
+// without booting the stdio MCP) and mirror scripts/iterm/tab_title.py.
+
+/**
+ * Stamp the broker-assigned peer_id where this session can read it: the
+ * GUPPI_PEER_ID env var (for child shells) + the pid-keyed marker file
+ * (shared writer in shared/stamp.ts, also used by the broker backstop).
+ */
+function stampPeerId(id: string): void {
+  process.env.GUPPI_PEER_ID = id;
+  stampPeerIdFile(process.pid, id, process.env.ITERM_PROFILE ?? "");
+}
+
+/** Read the channel's last_conv from workstreams/.state.json (best-effort). */
+function readLastConv(): string | undefined {
+  try {
+    const projectDir = process.env.CLAUDE_PROJECT_DIR || myGitRoot || myCwd;
+    if (!projectDir) return undefined;
+    const statePath = path.join(projectDir, "workstreams", ".state.json");
+    const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
+    if (!channel) return undefined;
+    const slice = data?.channels?.[channel];
+    const conv = slice?.last_conv;
+    return typeof conv === "string" && conv ? conv : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Re-render + emit the self-identifying tab title after a summary change. The
+ * server is a bun subprocess with no iTerm2 Python API, so it (a) records the
+ * new label into the marker file and (b) shells out to the AppleScript
+ * `set name` leg targeting $ITERM_SESSION_ID — both bypass the profile's
+ * `Allow Title Setting: false` OSC gate (CONV-8207). Fully best-effort: any
+ * failure is logged and swallowed so it can never break set_summary.
+ */
+function refreshTabTitle(summary: string): void {
+  try {
+    if (myId) {
+      stampPeerIdFile(process.pid, myId, process.env.ITERM_PROFILE ?? "", { LABEL: summary });
+    }
+    const sessionId = process.env.ITERM_SESSION_ID ?? "";
+    if (!sessionId) return; // not in an iTerm2 session (SSH/CI/Terminal.app)
+    const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
+    const title = composeTabTitle(channel, myId ?? undefined, readLastConv(), summary);
+    const uuid = sessionId.includes(":") ? sessionId.slice(sessionId.lastIndexOf(":") + 1) : sessionId;
+    // Explicit-session targeting (Roman directive 2026-05-11, CONV-8191): walk
+    // sessions by unique id rather than touching the frontmost window.
+    const applescript = [
+      "on run argv",
+      "  set targetTitle to item 1 of argv",
+      "  set targetUUID to item 2 of argv",
+      '  tell application "iTerm2"',
+      "    repeat with w in windows",
+      "      repeat with t in tabs of w",
+      "        repeat with s in sessions of t",
+      "          if (unique id of s as string) is targetUUID then",
+      "            tell s to set name to targetTitle",
+      "            return",
+      "          end if",
+      "        end repeat",
+      "      end repeat",
+      "    end repeat",
+      "  end tell",
+      "end run",
+    ].join("\n");
+    Bun.spawn(["osascript", "-", title, uuid], {
+      stdin: new TextEncoder().encode(applescript),
+      stdout: "ignore",
+      stderr: "ignore",
+    });
+  } catch (e) {
+    log(`refreshTabTitle failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
+  }
 }
 
 async function getGitRoot(cwd: string): Promise<string | null> {
@@ -382,6 +476,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         await brokerFetch("/set-summary", { id: myId, summary });
+        // CONV-10613: re-render the self-identifying tab title automatically on
+        // every explicit summary change — this is the in-MCP hook that keeps
+        // the tab current without any opt-in step. Best-effort; never makes the
+        // handler return isError on a title-emit failure.
+        refreshTabTitle(summary);
         return {
           content: [{ type: "text" as const, text: `Summary updated: "${summary}"` }],
         };
@@ -593,6 +692,12 @@ async function main() {
   myId = reg.id;
   log(`Registered as peer ${myId}`);
 
+  // CONV-10613: stamp the broker-assigned id where this session can read it
+  // (GUPPI_PEER_ID env + pid-keyed marker), closing the "session can't see its
+  // own peer_id" gap. Then paint the initial self-identifying tab title.
+  stampPeerId(myId);
+  refreshTabTitle(initialSummary);
+
   // If summary generation is still running, update it when done
   if (!initialSummary) {
     summaryPromise.then(async () => {
@@ -600,6 +705,8 @@ async function main() {
         try {
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
           log(`Late auto-summary applied: ${initialSummary}`);
+          // CONV-10613: re-render the tab title with the late auto-summary.
+          refreshTabTitle(initialSummary);
         } catch {
           // Non-critical
         }
