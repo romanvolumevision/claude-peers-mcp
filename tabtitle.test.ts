@@ -6,7 +6,17 @@
  */
 
 import { describe, test, expect } from "bun:test";
-import { composeTabTitle, profileToChannel, normaliseConv, CHANNEL_EMOJI } from "./shared/tabtitle";
+import {
+  composeTabTitle,
+  profileToChannel,
+  normaliseConv,
+  CHANNEL_EMOJI,
+  stripSummaryPrefix,
+  topicWords,
+  composeCompactTitle,
+  composeSessionName,
+  composeBadge,
+} from "./shared/tabtitle";
 
 describe("composeTabTitle", () => {
   test("full 4-segment string", () => {
@@ -83,5 +93,111 @@ describe("CHANNEL_EMOJI parity", () => {
     ]) {
       expect(CHANNEL_EMOJI[slug]).toBeTruthy();
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// CONV-10613 three-field rename — PARITY with tests/iterm/test_tab_title.py.
+// Every assertion here mirrors the Python suite verbatim (same inputs → same
+// expected strings). This is the gate-4 parity proof: keep both in lockstep.
+// ---------------------------------------------------------------------------
+
+describe("stripSummaryPrefix", () => {
+  test("kills the doubling", () => {
+    expect(stripSummaryPrefix("🟠 Orange CONV-10655 — fleet_live conv_id cleanup DONE")).toBe(
+      "fleet_live conv_id cleanup DONE",
+    );
+  });
+  test("parenthesised CONV (orchestrator banner)", () => {
+    expect(stripSummaryPrefix("🐙 ORCHESTRATOR (CONV-10613) — fleet at rest")).toBe("fleet at rest");
+  });
+  test("idempotent on a clean topic", () => {
+    expect(stripSummaryPrefix("Dispatch state dual-write fix")).toBe("Dispatch state dual-write fix");
+  });
+  test("null / empty / whitespace", () => {
+    expect(stripSummaryPrefix(null)).toBe("");
+    expect(stripSummaryPrefix(undefined)).toBe("");
+    expect(stripSummaryPrefix("")).toBe("");
+    expect(stripSummaryPrefix("   ")).toBe("");
+  });
+  test("separator variants", () => {
+    expect(stripSummaryPrefix("🟣 Purple — adopting pre-bind")).toBe("adopting pre-bind");
+    expect(stripSummaryPrefix("🟣 Purple: adopting pre-bind")).toBe("adopting pre-bind");
+    expect(stripSummaryPrefix("Green CONV-1 work item")).toBe("work item");
+  });
+});
+
+describe("topicWords", () => {
+  test("truncates to limit", () => {
+    expect(topicWords("one two three four five")).toBe("one two three");
+    expect(topicWords("one two three four five", 2)).toBe("one two");
+    expect(topicWords("")).toBe("");
+    expect(topicWords(null)).toBe("");
+    expect(topicWords("solo")).toBe("solo");
+  });
+});
+
+describe("composeCompactTitle (gate 1)", () => {
+  test("emoji-only, <=3 words, de-doubled", () => {
+    expect(
+      composeCompactTitle(
+        "orange",
+        "1frhehsa",
+        "CONV-10655",
+        "🟠 Orange CONV-10655 — fleet_live conv_id cleanup DONE",
+      ),
+    ).toBe("🟠 · 1frhehsa · CONV-10655 · fleet_live conv_id cleanup");
+  });
+  test("orchestrator", () => {
+    expect(
+      composeCompactTitle(
+        "orchestrator",
+        "tx7jhaav",
+        "CONV-10613",
+        "🐙 ORCHESTRATOR (CONV-10613) — fleet at rest",
+      ),
+    ).toBe("🐙 · tx7jhaav · CONV-10613 · fleet at rest");
+  });
+  test("placeholder when peer_id + summary absent", () => {
+    expect(composeCompactTitle("orange", undefined, "CONV-10655", undefined)).toBe("🟠 · CONV-10655");
+  });
+  test("unknown colour", () => {
+    expect(composeCompactTitle("teal", "p", "CONV-9", "do a thing now")).toBe("Teal · p · CONV-9 · do a thing");
+  });
+});
+
+describe("composeSessionName (gate 2)", () => {
+  test("long: keeps colour word + full topic", () => {
+    expect(
+      composeSessionName(
+        "orange",
+        "1frhehsa",
+        "CONV-10655",
+        "🟠 Orange CONV-10655 — fleet_live conv_id cleanup DONE",
+      ),
+    ).toBe("🟠 Orange · 1frhehsa · CONV-10655 · fleet_live conv_id cleanup DONE");
+  });
+  test("distinct from compact", () => {
+    const summary = "🟢 Green CONV-10560 — Dispatch state dual-write fix";
+    const compact = composeCompactTitle("green", "u60ssaqv", "CONV-10560", summary);
+    const session = composeSessionName("green", "u60ssaqv", "CONV-10560", summary);
+    expect(compact).toBe("🟢 · u60ssaqv · CONV-10560 · Dispatch state dual-write");
+    expect(session).toBe("🟢 Green · u60ssaqv · CONV-10560 · Dispatch state dual-write fix");
+    expect(compact).not.toBe(session);
+  });
+});
+
+describe("composeBadge (gate 3)", () => {
+  test("colour worker", () => {
+    expect(composeBadge("orange")).toBe("🟠 ORANGE");
+    expect(composeBadge("purple")).toBe("🟣 PURPLE");
+  });
+  test("orchestrator", () => {
+    expect(composeBadge("orchestrator")).toBe("🐙 ORCH");
+  });
+  test("channel-less role from summary", () => {
+    expect(composeBadge("", "deploy worker running batch jobs")).toBe("DEPLOY WORKER");
+    expect(composeBadge("", "")).toBe("CLAUDE");
+    expect(composeBadge("unknownslug")).toBe("CLAUDE");
   });
 });
