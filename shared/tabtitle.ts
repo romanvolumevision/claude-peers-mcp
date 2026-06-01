@@ -125,6 +125,7 @@ export function composeCompactTitle(
   peerId: string | undefined,
   conv: string | undefined,
   summary: string | undefined,
+  label?: string | undefined,
 ): string {
   const segments: string[] = [];
   const slug = (channel ?? "").toLowerCase();
@@ -134,7 +135,14 @@ export function composeCompactTitle(
   if (peerId && peerId.trim()) segments.push(peerId.trim());
   const convSeg = normaliseConv(conv);
   if (convSeg) segments.push(convSeg);
-  const topic = topicWords(stripSummaryPrefix(summary), 3);
+  // CONV-10613 (B — Roman directive): prefer the stable work-label (verbatim,
+  // e.g. "Plan #34 - LLM Hardening") over the churning live summary. Only fall
+  // back to the first 3 words of the prefix-stripped summary when no label is
+  // set. Parity with the GUPPI daemon paint (scripts/iterm/tab_title.py), which
+  // already sources the topic from .state.json `label`.
+  const topic = (label && label.trim())
+    ? label.trim()
+    : topicWords(stripSummaryPrefix(summary), 3);
   if (topic) segments.push(topic);
   return segments.join(" · ") || "Claude";
 }
@@ -149,8 +157,11 @@ export function composeSessionName(
   peerId: string | undefined,
   conv: string | undefined,
   summary: string | undefined,
+  label?: string | undefined,
 ): string {
-  return composeTabTitle(channel, peerId, conv, stripSummaryPrefix(summary));
+  // CONV-10613 (B): same work-label-over-summary precedence as composeCompactTitle.
+  const topic = (label && label.trim()) ? label.trim() : stripSummaryPrefix(summary);
+  return composeTabTitle(channel, peerId, conv, topic);
 }
 
 /**
