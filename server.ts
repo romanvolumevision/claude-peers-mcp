@@ -39,7 +39,7 @@ import { sign } from "./auth";
 import * as fs from "fs";
 import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
-import { composeTabTitle, profileToChannel } from "./shared/tabtitle";
+import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -179,20 +179,47 @@ function refreshTabTitle(summary: string): void {
     const sessionId = process.env.ITERM_SESSION_ID ?? "";
     if (!sessionId) return; // not in an iTerm2 session (SSH/CI/Terminal.app)
     const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
-    const title = composeTabTitle(channel, myId ?? undefined, readLastConv(), summary);
+    const conv = readLastConv();
+    const peer = myId ?? undefined;
+    // CONV-10613 three-field rename — kept in parity with the GUPPI daemon
+    // paint path (scripts/iterm/tab_title.py + guppi-daemon.py). The OLD code
+    // fed the raw `summary` as the title label, double-painting the
+    // "<emoji> <Colour>" the composer already prepends
+    // ("🟠 Orange · 1frhehsa · CONV-10655 · 🟠 Orange CONV-10655"). Now:
+    //   • session NAME  = the COMPACT identifier (the tab strip, since the
+    //     GUPPI profiles run Title Components = SESSION_NAME).
+    //   • user.window_title + user.session_subtitle = the LONG descriptive form
+    //     (the DynamicProfile interpolates them into Custom Window Title +
+    //     Subtitle — best-effort; harmless no-op if a profile renders neither).
+    //   • user.badge = colour / 1-2-word role (DynamicProfile Badge Text).
+    // All four are AppleScript-writable (set name / set variable) — the only
+    // parity-safe surfaces (tab.title + window.name are NOT settable via
+    // AppleScript; TitleComponents.CUSTOM needs a Python RPC the bun broker
+    // can't register). Probed live CONV-10657.
+    const compact = composeCompactTitle(channel, peer, conv, summary);
+    const sessionName = composeSessionName(channel, peer, conv, summary);
+    const badge = composeBadge(channel, summary);
     const uuid = sessionId.includes(":") ? sessionId.slice(sessionId.lastIndexOf(":") + 1) : sessionId;
     // Explicit-session targeting (Roman directive 2026-05-11, CONV-8191): walk
     // sessions by unique id rather than touching the frontmost window.
     const applescript = [
       "on run argv",
-      "  set targetTitle to item 1 of argv",
+      "  set targetName to item 1 of argv",
       "  set targetUUID to item 2 of argv",
+      "  set winTitle to item 3 of argv",
+      "  set subTitle to item 4 of argv",
+      "  set badgeText to item 5 of argv",
       '  tell application "iTerm2"',
       "    repeat with w in windows",
       "      repeat with t in tabs of w",
       "        repeat with s in sessions of t",
       "          if (unique id of s as string) is targetUUID then",
-      "            tell s to set name to targetTitle",
+      "            tell s",
+      "              set name to targetName",
+      '              set variable named "user.window_title" to winTitle',
+      '              set variable named "user.session_subtitle" to subTitle',
+      '              set variable named "user.badge" to badgeText',
+      "            end tell",
       "            return",
       "          end if",
       "        end repeat",
@@ -201,7 +228,7 @@ function refreshTabTitle(summary: string): void {
       "  end tell",
       "end run",
     ].join("\n");
-    Bun.spawn(["osascript", "-", title, uuid], {
+    Bun.spawn(["osascript", "-", compact, uuid, sessionName, sessionName, badge], {
       stdin: new TextEncoder().encode(applescript),
       stdout: "ignore",
       stderr: "ignore",
