@@ -163,6 +163,27 @@ function readLastConv(): string | undefined {
   }
 }
 
+/** Read the channel's work-label from workstreams/.state.json (best-effort).
+ * CONV-10613 (B): the stable tab topic source — "just what we're working on",
+ * not the churning summary. Treats null / "none" as absent. */
+function readLabel(): string | undefined {
+  try {
+    const projectDir = process.env.CLAUDE_PROJECT_DIR || myGitRoot || myCwd;
+    if (!projectDir) return undefined;
+    const statePath = path.join(projectDir, "workstreams", ".state.json");
+    const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
+    const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
+    if (!channel) return undefined;
+    const slice = data?.channels?.[channel];
+    const label = slice?.label;
+    return (typeof label === "string" && label.trim() && label.trim().toLowerCase() !== "none")
+      ? label.trim()
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /**
  * Re-render + emit the self-identifying tab title after a summary change. The
  * server is a bun subprocess with no iTerm2 Python API, so it (a) records the
@@ -196,8 +217,9 @@ function refreshTabTitle(summary: string): void {
     // parity-safe surfaces (tab.title + window.name are NOT settable via
     // AppleScript; TitleComponents.CUSTOM needs a Python RPC the bun broker
     // can't register). Probed live CONV-10657.
-    const compact = composeCompactTitle(channel, peer, conv, summary);
-    const sessionName = composeSessionName(channel, peer, conv, summary);
+    const label = readLabel();
+    const compact = composeCompactTitle(channel, peer, conv, summary, label);
+    const sessionName = composeSessionName(channel, peer, conv, summary, label);
     const badge = composeBadge(channel, summary);
     const uuid = sessionId.includes(":") ? sessionId.slice(sessionId.lastIndexOf(":") + 1) : sessionId;
     // Explicit-session targeting (Roman directive 2026-05-11, CONV-8191): walk
