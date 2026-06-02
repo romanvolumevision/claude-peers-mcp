@@ -360,6 +360,7 @@ function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
   if (!ALLOWED_KILL_SIGNALS.has(signal)) {
     return { ok: false, error: `Unsupported signal ${signal} (allowed: SIGTERM, SIGKILL, SIGINT)` };
   }
+  const actor = body.from_id ?? null;
   try {
     process.kill(peer.pid, signal as NodeJS.Signals);
   } catch (e) {
@@ -367,8 +368,28 @@ function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
     if (code === "ESRCH") {
       // Process is already gone — clean up the stale row and report success.
       dropPeer(peer.id);
+      // A5 (Open-016, CONV-10639): mirror the Python guppi-mcp
+      // kill_peer_dispatched envelope so a destructive cross-tier kill is at
+      // least as observable as a keystroke. ESRCH = no signal actually
+      // delivered; record the stale-clean outcome so audit doesn't imply a
+      // live process was terminated. Never-raise (emitAudit is fire-and-forget).
+      emitAudit("kill_peer_dispatched", {
+        actor,
+        target_peer_id: peer.id,
+        target_pid: peer.pid,
+        signal,
+        result: "esrch_stale_cleaned",
+      });
       return { ok: true, pid: peer.pid, error: "process already exited (stale peer cleaned)" };
     }
+    emitAudit("kill_peer_dispatched", {
+      actor,
+      target_peer_id: peer.id,
+      target_pid: peer.pid,
+      signal,
+      result: "error",
+      detail: e instanceof Error ? e.message : String(e),
+    });
     return {
       ok: false,
       error: `kill(${peer.pid}, ${signal}) failed: ${e instanceof Error ? e.message : String(e)}`,
@@ -377,7 +398,17 @@ function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
   // Drop the peer so it disappears from list-peers immediately; the target's
   // own SIGTERM handler also calls /unregister (a no-op if we win the race).
   dropPeer(peer.id);
-  console.error(`[claude-peers broker] kill ${peer.id} (pid ${peer.pid}, ${signal}) by ${body.from_id ?? "?"}`);
+  console.error(`[claude-peers broker] kill ${peer.id} (pid ${peer.pid}, ${signal}) by ${actor ?? "?"}`);
+  // A5: action-level audit envelope for the successful kill dispatch. This is
+  // the irreversible, cross-tier branch — the one that most needs to be at
+  // least as observable as a keystroke. Fire-and-forget; never blocks/raises.
+  emitAudit("kill_peer_dispatched", {
+    actor,
+    target_peer_id: peer.id,
+    target_pid: peer.pid,
+    signal,
+    result: "ok",
+  });
   return { ok: true, pid: peer.pid };
 }
 
