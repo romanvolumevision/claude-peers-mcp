@@ -38,6 +38,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
+import { shouldReRegister } from "./shared/reregister";
+import type { HeartbeatResponse } from "./shared/types.ts";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -298,6 +300,11 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Open-016 Phase 3b: cached registration context so reRegister() can re-POST
+// /register with the same shape after a broker loss (set once in main()).
+let myTty: string | null = null;
+let myProfile = "";
+let mySummary = "";
 
 // --- MCP Server ---
 
@@ -510,6 +517,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        mySummary = summary;
         await brokerFetch("/set-summary", { id: myId, summary });
         // CONV-10613: re-render the self-identifying tab title automatically on
         // every explicit summary change — this is the in-MCP hook that keeps
@@ -624,6 +632,39 @@ async function pollAndPushMessages() {
   }
 }
 
+// --- Re-register on broker loss (Open-016 Phase 3b) ---
+//
+// /register happens once at startup. After a broker restart the adapter is
+// alive but registered nowhere, so poll/heartbeat silently no-op and the
+// session lingers blind. We re-/register when the broker reports it no longer
+// knows us (heartbeat `known: false`). The broker reuses the id for our known
+// live PID (Phase 3c), so the re-register is identity-stable — myId is
+// unchanged in the normal case, and we re-stamp + repaint either way.
+async function reRegister(): Promise<void> {
+  try {
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: myTty,
+      profile: myProfile,
+      summary: mySummary,
+    });
+    const prev = myId;
+    myId = reg.id;
+    stampPeerId(myId);
+    if (prev && prev !== myId) {
+      // Should not happen for a live PID (Phase 3c reuses the id); surface it
+      // loudly if the broker minted a fresh id so an id-flip is never silent.
+      log(`WARN: re-register changed peer id ${prev} -> ${myId} (expected stable for a live PID)`);
+    }
+    log(`Re-registered with broker as peer ${myId} (broker had forgotten us)`);
+    refreshTabTitle(mySummary);
+  } catch (e) {
+    log(`Re-register failed (will retry on next heartbeat): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // --- Startup ---
 
 async function main() {
@@ -637,6 +678,10 @@ async function main() {
   // ITERM_PROFILE is set automatically by iTerm2 to the dynamic-profile name
   // (e.g. "Blue Shadow"). Empty string for non-iTerm callers.
   const profile = process.env.ITERM_PROFILE ?? "";
+  // Open-016 Phase 3b: cache the registration context so reRegister() can
+  // re-POST /register with the same shape after a broker loss.
+  myTty = tty;
+  myProfile = profile;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
@@ -677,6 +722,7 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
+  mySummary = initialSummary;
   log(`Registered as peer ${myId}`);
 
   // CONV-10613: stamp the broker-assigned id where this session can read it
@@ -690,6 +736,7 @@ async function main() {
     summaryPromise.then(async () => {
       if (initialSummary && myId) {
         try {
+          mySummary = initialSummary;
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
           log(`Late auto-summary applied: ${initialSummary}`);
           // CONV-10613: re-render the tab title with the late auto-summary.
@@ -708,13 +755,21 @@ async function main() {
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat. Open-016 Phase 3b: the broker now reports whether it
+  // still knows us; on `known: false` (broker restarted / forgot us) we
+  // re-/register instead of silently no-op'ing. The broker reuses our id for
+  // our live PID (Phase 3c) so the re-register is identity-stable.
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
+        const hb = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId });
+        if (shouldReRegister(hb)) {
+          log("Broker no longer knows this peer (known:false) — re-registering");
+          await reRegister();
+        }
       } catch {
-        // Non-critical
+        // Broker likely down right now; the next heartbeat re-checks and
+        // re-registers once it is back (heartbeat reports known:false then).
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
