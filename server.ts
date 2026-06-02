@@ -40,6 +40,7 @@ import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
 import { shouldReRegister } from "./shared/reregister";
 import type { HeartbeatResponse } from "./shared/types.ts";
+import { makeTransportCloseHandler } from "./shared/transport_close";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -748,9 +749,42 @@ async function main() {
     });
   }
 
-  // 5. Connect MCP over stdio
-  await mcp.connect(new StdioServerTransport());
+  // 5. Connect MCP over stdio. Open-016 Phase 3a: attach close/error handlers
+  // so a stdio EOF / transport error is SURFACED loudly instead of stranding
+  // the session silently (the CONV-10639 "claude-peers seems broken" bug).
+  // PROBE RESULT (plan §6 Q1): the CLI does NOT auto-respawn a non-zero-exit
+  // stdio MCP — so we emit a loud stderr line with a `/mcp` recovery nudge
+  // BEFORE exiting non-zero, rather than exiting silently. mcp.connect() sets
+  // the transport's onclose/onerror for its own protocol cleanup, so we wrap
+  // (call-through) rather than clobber.
+  const transport = new StdioServerTransport();
+  await mcp.connect(transport);
   log("MCP connected");
+
+  const closeHandler = makeTransportCloseHandler(
+    { log, exit: (code) => process.exit(code) },
+    "close",
+  );
+  const errorHandler = makeTransportCloseHandler(
+    { log, exit: (code) => process.exit(code) },
+    "error",
+  );
+  const priorOnClose = transport.onclose?.bind(transport);
+  const priorOnError = transport.onerror?.bind(transport);
+  transport.onclose = () => {
+    try {
+      priorOnClose?.();
+    } finally {
+      closeHandler();
+    }
+  };
+  transport.onerror = (err) => {
+    try {
+      priorOnError?.(err);
+    } finally {
+      errorHandler(err);
+    }
+  };
 
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
