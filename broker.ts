@@ -298,7 +298,27 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
     peers = peers.filter((p) => p.id !== body.exclude_id);
   }
 
-  // Verify each peer's process is still alive
+  // Verify each peer's process is still alive.
+  //
+  // CROSS-REPO INVARIANT (GUPPI orchestrator.lock — Open-016 / CONV-10639):
+  // this inline `process.kill(p.pid, 0)` PID-filter (together with the 30s
+  // cleanStalePeers setInterval above) is the liveness guard the GUPPI
+  // orch-lock harness-liveness self-release depends on. GUPPI's
+  // lock._orch_harness_peer_present() trusts membership of THIS /list-peers
+  // response as proof of PID-liveness and applies NO recency filter of its
+  // own — so if this filter is weakened or removed, a dead orch is no longer
+  // reaped promptly and the fail-CLOSED orch-lock can hang.
+  //
+  // The contract is regression-tested in the CONTROL-PLANE repo (NOT here),
+  // in tests/orchestrator/test_lock.py. The live guards today are
+  // test_harness_peer_present_tri_state and
+  // test_harness_peer_present_ignores_stale_orch_peer. A dedicated
+  // test_broker_membership_is_pid_filtered_contract is being added there by
+  // the control-plane builder under Open-016 Phase 3 — do NOT cite it as
+  // already-existing until that lands; this comment names the tests that DO
+  // exist. Any change to this filter (or the Phase-3c re-register id-reuse,
+  // which briefly removes-then-re-adds a row) MUST be gated by running that
+  // control-plane suite — see plan §3a cross-repo verification matrix.
   return peers.filter((p) => {
     try {
       process.kill(p.pid, 0);
