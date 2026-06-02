@@ -23,9 +23,7 @@ import type {
   PeerId,
   Peer,
   RegisterResponse,
-  KillPeerResponse,
   PollMessagesResponse,
-  Message,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -321,7 +319,6 @@ Available tools:
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
-- kill_peer: Terminate another instance by ID (sends SIGTERM, or SIGKILL/SIGINT). Use sparingly — this kills the target process. Prefer send_message with a "please stop" / session.pause envelope first; reserve kill_peer for an unresponsive peer or an orchestrator-level emergency stop.
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -329,7 +326,11 @@ When you start, proactively call set_summary to describe what you're working on.
 
 // --- Tool definitions ---
 
-const TOOLS = [
+// Exported so the comms-surface contract (Open-016: exactly the 4 peer-to-peer
+// comms tools, NO kill_peer) is unit-testable without booting the stdio MCP /
+// broker (server.ts only runs main() when invoked as the entry point — see the
+// `import.meta.main` guard at the bottom).
+export const TOOLS = [
   {
     name: "list_peers",
     description:
@@ -390,27 +391,12 @@ const TOOLS = [
       properties: {},
     },
   },
-  {
-    name: "kill_peer",
-    description:
-      "Terminate another Claude Code instance by peer ID. Sends a signal (default SIGTERM) to the target's process. Use sparingly: prefer send_message with a 'please stop' / session.pause request first, and reserve this for an unresponsive peer or an orchestrator-level emergency stop. The target leaves list_peers immediately on success.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        to_id: {
-          type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
-        },
-        signal: {
-          type: "string" as const,
-          enum: ["SIGTERM", "SIGKILL", "SIGINT"],
-          description:
-            "Signal to send (default SIGTERM — lets the target unregister + exit cleanly). Use SIGKILL only if SIGTERM did not work.",
-        },
-      },
-      required: ["to_id"],
-    },
-  },
+  // Open-016 (CONV-10639): `kill_peer` is intentionally NOT a comms tool. Peer
+  // termination is an orchestration authority that lives on the env-gated
+  // orchestrator MCP (~/guppi-mcp), which calls the broker's POST /kill-peer
+  // over HTTP. The broker route + handleKillPeer() stay in broker.ts as the
+  // sole executor; only the comms-side tool surface drops it. Least-privilege:
+  // colour peers can no longer kill their siblings.
 ];
 
 // --- Tool handlers ---
@@ -577,54 +563,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    case "kill_peer": {
-      const { to_id, signal } = args as { to_id: string; signal?: "SIGTERM" | "SIGKILL" | "SIGINT" };
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
-      if (to_id === myId) {
-        return {
-          content: [{ type: "text" as const, text: "Refusing to kill_peer myself — exit normally instead." }],
-          isError: true,
-        };
-      }
-      try {
-        const result = await brokerFetch<KillPeerResponse>("/kill-peer", {
-          from_id: myId,
-          to_id,
-          signal,
-        });
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to kill peer ${to_id}: ${result.error}` }],
-            isError: true,
-          };
-        }
-        const note = result.error ? ` (${result.error})` : "";
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Sent ${signal ?? "SIGTERM"} to peer ${to_id} (pid ${result.pid})${note}.`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error killing peer: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
@@ -800,7 +738,12 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+// Only boot the stdio server + broker when run as the entry point. Importing
+// this module (e.g. from a test that introspects the TOOLS surface) must NOT
+// trigger main() / ensureBroker() / a live /register.
+if (import.meta.main) {
+  main().catch((e) => {
+    log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}
