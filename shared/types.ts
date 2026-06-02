@@ -41,6 +41,17 @@ export interface HeartbeatRequest {
   id: PeerId;
 }
 
+// Open-016 Phase 3 (CONV-10639): the heartbeat response now reports whether the
+// broker still knows this peer id. After a broker restart the adapter is alive
+// but registered nowhere; `known: false` is the signal the adapter uses to
+// re-`/register` (preserving its id via the broker's reuse-id-for-known-PID
+// path). Optional so older brokers stay backward-tolerant — the adapter treats
+// a missing field as "known" and won't churn re-registrations against them.
+export interface HeartbeatResponse {
+  ok: true;
+  known?: boolean;
+}
+
 export interface SetSummaryRequest {
   id: PeerId;
   summary: string;

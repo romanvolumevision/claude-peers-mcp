@@ -37,6 +37,7 @@ import type {
   RegisterRequest,
   RegisterResponse,
   HeartbeatRequest,
+  HeartbeatResponse,
   SetSummaryRequest,
   ListPeersRequest,
   SendMessageRequest,
@@ -186,16 +187,57 @@ function generateId(): string {
 
 // --- Request handlers ---
 
+// Open-016 Phase 3 (CONV-10639): a re-register MUST preserve the peer id when
+// it comes from a still-live PID we already know. The old code minted a fresh
+// id + DELETEd the prior PID row on EVERY /register, so an adapter that
+// re-registered after a broker blip got a brand-new id — which breaks orch
+// dispatch tracking, the .state.json holder, and the pid-keyed stamp. Decision
+// (plan §3 R8, single committed mechanism): the BROKER reuses the existing id
+// for a known live PID. A new PID still mints fresh; a dead prior PID is still
+// reaped. This is the only id-stability mechanism — the adapter does NOT
+// re-stamp a fresh id, it just re-/registers and gets the same id back.
 function handleRegister(body: RegisterRequest): RegisterResponse {
-  const id = generateId();
   const now = new Date().toISOString();
 
-  // Remove any existing registration for this PID (re-registration)
-  const existing = db.query("SELECT id FROM peers WHERE pid = ?").get(body.pid) as { id: string } | null;
+  // Look up any existing registration for this PID.
+  const existing = db.query("SELECT id, pid FROM peers WHERE pid = ?").get(body.pid) as
+    | { id: string; pid: number }
+    | null;
+
   if (existing) {
+    // Known PID. Reuse the id IF the process is still alive (a genuine
+    // re-register of the same session — preserve identity). If the PID is dead
+    // (a recycled PID now owned by a different process) reap the stale row and
+    // mint fresh below.
+    let pidAlive = true;
+    try {
+      process.kill(existing.pid, 0);
+    } catch {
+      pidAlive = false;
+    }
+    if (pidAlive) {
+      // Refresh the mutable fields in place; KEEP the id.
+      db.run(
+        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, summary = ?, last_seen = ? WHERE id = ?",
+        [
+          body.cwd,
+          body.git_root,
+          body.tty,
+          body.profile ?? "",
+          body.summary,
+          now,
+          existing.id,
+        ],
+      );
+      // Re-stamp the marker (idempotent — same filename + format).
+      stampPeerIdFile(body.pid, existing.id, body.profile ?? "");
+      return { id: existing.id };
+    }
+    // Dead PID — recycled. Drop the stale row and fall through to mint fresh.
     deletePeer.run(existing.id);
   }
 
+  const id = generateId();
   insertPeer.run(
     id,
     body.pid,
@@ -216,8 +258,13 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   return { id };
 }
 
-function handleHeartbeat(body: HeartbeatRequest): void {
-  updateLastSeen.run(new Date().toISOString(), body.id);
+// Open-016 Phase 3 (CONV-10639): report whether this id is still known. The
+// UPDATE is a no-op for an unknown id, so `changes === 0` means the broker has
+// no record of this peer (e.g. it restarted) — the adapter re-/registers on
+// that signal. `known` is the heartbeat's failed/not-registered detector.
+function handleHeartbeat(body: HeartbeatRequest): HeartbeatResponse {
+  const res = updateLastSeen.run(new Date().toISOString(), body.id);
+  return { ok: true, known: res.changes > 0 };
 }
 
 function handleSetSummary(body: SetSummaryRequest): void {
@@ -480,8 +527,7 @@ Bun.serve({
         case "/register":
           return Response.json(handleRegister(body as RegisterRequest));
         case "/heartbeat":
-          handleHeartbeat(body as HeartbeatRequest);
-          return Response.json({ ok: true });
+          return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
           return Response.json({ ok: true });
