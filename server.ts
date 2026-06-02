@@ -23,9 +23,7 @@ import type {
   PeerId,
   Peer,
   RegisterResponse,
-  KillPeerResponse,
   PollMessagesResponse,
-  Message,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -40,13 +38,18 @@ import * as fs from "fs";
 import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
+import { shouldReRegister } from "./shared/reregister";
+import type { HeartbeatResponse } from "./shared/types.ts";
+import { makeTransportCloseHandler } from "./shared/transport_close";
+import { waitForBrokerHealthy } from "./shared/wait_broker";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// Open-016 Phase 3d: the adapter no longer self-spawns a broker (launchd owns
+// it), so the broker script path is no longer needed here.
 
 // --- Broker communication ---
 
@@ -87,31 +90,28 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
+// Open-016 Phase 3d: trust launchd as the SOLE broker owner. The old
+// self-spawn made BOTH launchd and any adapter able to start a broker, racing
+// for :7899 (EADDRINUSE / repeated "listening on :7899" noise) — and two
+// brokers on one SQLite WAL is corruption. So we no longer spawn a broker; we
+// just WAIT for launchd's broker to be healthy. If it never comes up the
+// startup throws (a fail-fast the supervisor / operator can see), rather than
+// the adapter silently racing a second broker into existence.
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
-    log("Broker already running");
+    log("Broker is healthy");
     return;
   }
-
-  log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
-  });
-
-  // Unref so this process can exit without waiting for the broker
-  proc.unref();
-
-  // Wait for it to come up
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
-    if (await isBrokerAlive()) {
-      log("Broker started");
-      return;
-    }
+  log("Broker not yet healthy — waiting for launchd-owned broker (NOT self-spawning)...");
+  const healthy = await waitForBrokerHealthy(isBrokerAlive, { attempts: 30, intervalMs: 200 });
+  if (!healthy) {
+    throw new Error(
+      "Broker did not become healthy after 6s. launchd owns the broker " +
+        "(com.guppi.claude-peers-broker.plist); check `launchctl list | grep claude-peers-broker` " +
+        "and the broker log. The adapter no longer self-spawns a broker (Open-016 Phase 3d).",
+    );
   }
-  throw new Error("Failed to start broker daemon after 6 seconds");
+  log("Broker became healthy");
 }
 
 // --- Utility ---
@@ -300,6 +300,11 @@ function getTty(): string | null {
 let myId: PeerId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// Open-016 Phase 3b: cached registration context so reRegister() can re-POST
+// /register with the same shape after a broker loss (set once in main()).
+let myTty: string | null = null;
+let myProfile = "";
+let mySummary = "";
 
 // --- MCP Server ---
 
@@ -321,7 +326,6 @@ Available tools:
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
-- kill_peer: Terminate another instance by ID (sends SIGTERM, or SIGKILL/SIGINT). Use sparingly — this kills the target process. Prefer send_message with a "please stop" / session.pause envelope first; reserve kill_peer for an unresponsive peer or an orchestrator-level emergency stop.
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -329,7 +333,11 @@ When you start, proactively call set_summary to describe what you're working on.
 
 // --- Tool definitions ---
 
-const TOOLS = [
+// Exported so the comms-surface contract (Open-016: exactly the 4 peer-to-peer
+// comms tools, NO kill_peer) is unit-testable without booting the stdio MCP /
+// broker (server.ts only runs main() when invoked as the entry point — see the
+// `import.meta.main` guard at the bottom).
+export const TOOLS = [
   {
     name: "list_peers",
     description:
@@ -390,27 +398,12 @@ const TOOLS = [
       properties: {},
     },
   },
-  {
-    name: "kill_peer",
-    description:
-      "Terminate another Claude Code instance by peer ID. Sends a signal (default SIGTERM) to the target's process. Use sparingly: prefer send_message with a 'please stop' / session.pause request first, and reserve this for an unresponsive peer or an orchestrator-level emergency stop. The target leaves list_peers immediately on success.",
-    inputSchema: {
-      type: "object" as const,
-      properties: {
-        to_id: {
-          type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
-        },
-        signal: {
-          type: "string" as const,
-          enum: ["SIGTERM", "SIGKILL", "SIGINT"],
-          description:
-            "Signal to send (default SIGTERM — lets the target unregister + exit cleanly). Use SIGKILL only if SIGTERM did not work.",
-        },
-      },
-      required: ["to_id"],
-    },
-  },
+  // Open-016 (CONV-10639): `kill_peer` is intentionally NOT a comms tool. Peer
+  // termination is an orchestration authority that lives on the env-gated
+  // orchestrator MCP (~/guppi-mcp), which calls the broker's POST /kill-peer
+  // over HTTP. The broker route + handleKillPeer() stay in broker.ts as the
+  // sole executor; only the comms-side tool surface drops it. Least-privilege:
+  // colour peers can no longer kill their siblings.
 ];
 
 // --- Tool handlers ---
@@ -524,6 +517,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
+        mySummary = summary;
         await brokerFetch("/set-summary", { id: myId, summary });
         // CONV-10613: re-render the self-identifying tab title automatically on
         // every explicit summary change — this is the in-MCP hook that keeps
@@ -577,54 +571,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
-            },
-          ],
-          isError: true,
-        };
-      }
-    }
-
-    case "kill_peer": {
-      const { to_id, signal } = args as { to_id: string; signal?: "SIGTERM" | "SIGKILL" | "SIGINT" };
-      if (!myId) {
-        return {
-          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
-          isError: true,
-        };
-      }
-      if (to_id === myId) {
-        return {
-          content: [{ type: "text" as const, text: "Refusing to kill_peer myself — exit normally instead." }],
-          isError: true,
-        };
-      }
-      try {
-        const result = await brokerFetch<KillPeerResponse>("/kill-peer", {
-          from_id: myId,
-          to_id,
-          signal,
-        });
-        if (!result.ok) {
-          return {
-            content: [{ type: "text" as const, text: `Failed to kill peer ${to_id}: ${result.error}` }],
-            isError: true,
-          };
-        }
-        const note = result.error ? ` (${result.error})` : "";
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Sent ${signal ?? "SIGTERM"} to peer ${to_id} (pid ${result.pid})${note}.`,
-            },
-          ],
-        };
-      } catch (e) {
-        return {
-          content: [
-            {
-              type: "text" as const,
-              text: `Error killing peer: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
@@ -686,6 +632,39 @@ async function pollAndPushMessages() {
   }
 }
 
+// --- Re-register on broker loss (Open-016 Phase 3b) ---
+//
+// /register happens once at startup. After a broker restart the adapter is
+// alive but registered nowhere, so poll/heartbeat silently no-op and the
+// session lingers blind. We re-/register when the broker reports it no longer
+// knows us (heartbeat `known: false`). The broker reuses the id for our known
+// live PID (Phase 3c), so the re-register is identity-stable — myId is
+// unchanged in the normal case, and we re-stamp + repaint either way.
+async function reRegister(): Promise<void> {
+  try {
+    const reg = await brokerFetch<RegisterResponse>("/register", {
+      pid: process.pid,
+      cwd: myCwd,
+      git_root: myGitRoot,
+      tty: myTty,
+      profile: myProfile,
+      summary: mySummary,
+    });
+    const prev = myId;
+    myId = reg.id;
+    stampPeerId(myId);
+    if (prev && prev !== myId) {
+      // Should not happen for a live PID (Phase 3c reuses the id); surface it
+      // loudly if the broker minted a fresh id so an id-flip is never silent.
+      log(`WARN: re-register changed peer id ${prev} -> ${myId} (expected stable for a live PID)`);
+    }
+    log(`Re-registered with broker as peer ${myId} (broker had forgotten us)`);
+    refreshTabTitle(mySummary);
+  } catch (e) {
+    log(`Re-register failed (will retry on next heartbeat): ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 // --- Startup ---
 
 async function main() {
@@ -699,6 +678,10 @@ async function main() {
   // ITERM_PROFILE is set automatically by iTerm2 to the dynamic-profile name
   // (e.g. "Blue Shadow"). Empty string for non-iTerm callers.
   const profile = process.env.ITERM_PROFILE ?? "";
+  // Open-016 Phase 3b: cache the registration context so reRegister() can
+  // re-POST /register with the same shape after a broker loss.
+  myTty = tty;
+  myProfile = profile;
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
@@ -739,6 +722,7 @@ async function main() {
     summary: initialSummary,
   });
   myId = reg.id;
+  mySummary = initialSummary;
   log(`Registered as peer ${myId}`);
 
   // CONV-10613: stamp the broker-assigned id where this session can read it
@@ -752,6 +736,7 @@ async function main() {
     summaryPromise.then(async () => {
       if (initialSummary && myId) {
         try {
+          mySummary = initialSummary;
           await brokerFetch("/set-summary", { id: myId, summary: initialSummary });
           log(`Late auto-summary applied: ${initialSummary}`);
           // CONV-10613: re-render the tab title with the late auto-summary.
@@ -763,20 +748,61 @@ async function main() {
     });
   }
 
-  // 5. Connect MCP over stdio
-  await mcp.connect(new StdioServerTransport());
+  // 5. Connect MCP over stdio. Open-016 Phase 3a: attach close/error handlers
+  // so a stdio EOF / transport error is SURFACED loudly instead of stranding
+  // the session silently (the CONV-10639 "claude-peers seems broken" bug).
+  // PROBE RESULT (plan §6 Q1): the CLI does NOT auto-respawn a non-zero-exit
+  // stdio MCP — so we emit a loud stderr line with a `/mcp` recovery nudge
+  // BEFORE exiting non-zero, rather than exiting silently. mcp.connect() sets
+  // the transport's onclose/onerror for its own protocol cleanup, so we wrap
+  // (call-through) rather than clobber.
+  const transport = new StdioServerTransport();
+  await mcp.connect(transport);
   log("MCP connected");
+
+  const closeHandler = makeTransportCloseHandler(
+    { log, exit: (code) => process.exit(code) },
+    "close",
+  );
+  const errorHandler = makeTransportCloseHandler(
+    { log, exit: (code) => process.exit(code) },
+    "error",
+  );
+  const priorOnClose = transport.onclose?.bind(transport);
+  const priorOnError = transport.onerror?.bind(transport);
+  transport.onclose = () => {
+    try {
+      priorOnClose?.();
+    } finally {
+      closeHandler();
+    }
+  };
+  transport.onerror = (err) => {
+    try {
+      priorOnError?.(err);
+    } finally {
+      errorHandler(err);
+    }
+  };
 
   // 6. Start polling for inbound messages
   const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
 
-  // 7. Start heartbeat
+  // 7. Start heartbeat. Open-016 Phase 3b: the broker now reports whether it
+  // still knows us; on `known: false` (broker restarted / forgot us) we
+  // re-/register instead of silently no-op'ing. The broker reuses our id for
+  // our live PID (Phase 3c) so the re-register is identity-stable.
   const heartbeatTimer = setInterval(async () => {
     if (myId) {
       try {
-        await brokerFetch("/heartbeat", { id: myId });
+        const hb = await brokerFetch<HeartbeatResponse>("/heartbeat", { id: myId });
+        if (shouldReRegister(hb)) {
+          log("Broker no longer knows this peer (known:false) — re-registering");
+          await reRegister();
+        }
       } catch {
-        // Non-critical
+        // Broker likely down right now; the next heartbeat re-checks and
+        // re-registers once it is back (heartbeat reports known:false then).
       }
     }
   }, HEARTBEAT_INTERVAL_MS);
@@ -800,7 +826,12 @@ async function main() {
   process.on("SIGTERM", cleanup);
 }
 
-main().catch((e) => {
-  log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
-  process.exit(1);
-});
+// Only boot the stdio server + broker when run as the entry point. Importing
+// this module (e.g. from a test that introspects the TOOLS surface) must NOT
+// trigger main() / ensureBroker() / a live /register.
+if (import.meta.main) {
+  main().catch((e) => {
+    log(`Fatal: ${e instanceof Error ? e.message : String(e)}`);
+    process.exit(1);
+  });
+}
