@@ -41,13 +41,15 @@ import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel
 import { shouldReRegister } from "./shared/reregister";
 import type { HeartbeatResponse } from "./shared/types.ts";
 import { makeTransportCloseHandler } from "./shared/transport_close";
+import { waitForBrokerHealthy } from "./shared/wait_broker";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
-const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
+// Open-016 Phase 3d: the adapter no longer self-spawns a broker (launchd owns
+// it), so the broker script path is no longer needed here.
 
 // --- Broker communication ---
 
@@ -88,31 +90,28 @@ async function isBrokerAlive(): Promise<boolean> {
   }
 }
 
+// Open-016 Phase 3d: trust launchd as the SOLE broker owner. The old
+// self-spawn made BOTH launchd and any adapter able to start a broker, racing
+// for :7899 (EADDRINUSE / repeated "listening on :7899" noise) — and two
+// brokers on one SQLite WAL is corruption. So we no longer spawn a broker; we
+// just WAIT for launchd's broker to be healthy. If it never comes up the
+// startup throws (a fail-fast the supervisor / operator can see), rather than
+// the adapter silently racing a second broker into existence.
 async function ensureBroker(): Promise<void> {
   if (await isBrokerAlive()) {
-    log("Broker already running");
+    log("Broker is healthy");
     return;
   }
-
-  log("Starting broker daemon...");
-  const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
-    stdio: ["ignore", "ignore", "inherit"],
-    // Detach so the broker survives if this MCP server exits
-    // On macOS/Linux, the broker will keep running
-  });
-
-  // Unref so this process can exit without waiting for the broker
-  proc.unref();
-
-  // Wait for it to come up
-  for (let i = 0; i < 30; i++) {
-    await new Promise((r) => setTimeout(r, 200));
-    if (await isBrokerAlive()) {
-      log("Broker started");
-      return;
-    }
+  log("Broker not yet healthy — waiting for launchd-owned broker (NOT self-spawning)...");
+  const healthy = await waitForBrokerHealthy(isBrokerAlive, { attempts: 30, intervalMs: 200 });
+  if (!healthy) {
+    throw new Error(
+      "Broker did not become healthy after 6s. launchd owns the broker " +
+        "(com.guppi.claude-peers-broker.plist); check `launchctl list | grep claude-peers-broker` " +
+        "and the broker log. The adapter no longer self-spawns a broker (Open-016 Phase 3d).",
+    );
   }
-  throw new Error("Failed to start broker daemon after 6 seconds");
+  log("Broker became healthy");
 }
 
 // --- Utility ---
