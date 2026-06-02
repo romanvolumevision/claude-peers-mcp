@@ -310,15 +310,15 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
   // reaped promptly and the fail-CLOSED orch-lock can hang.
   //
   // The contract is regression-tested in the CONTROL-PLANE repo (NOT here),
-  // in tests/orchestrator/test_lock.py. The live guards today are
-  // test_harness_peer_present_tri_state and
-  // test_harness_peer_present_ignores_stale_orch_peer. A dedicated
-  // test_broker_membership_is_pid_filtered_contract is being added there by
-  // the control-plane builder under Open-016 Phase 3 — do NOT cite it as
-  // already-existing until that lands; this comment names the tests that DO
-  // exist. Any change to this filter (or the Phase-3c re-register id-reuse,
-  // which briefly removes-then-re-adds a row) MUST be gated by running that
-  // control-plane suite — see plan §3a cross-repo verification matrix.
+  // in tests/orchestrator/test_lock.py. The live guards are
+  // test_harness_peer_present_tri_state,
+  // test_harness_peer_present_ignores_stale_orch_peer, and the dedicated
+  // test_broker_membership_is_pid_filtered_contract — the last landed under
+  // Open-016 Phase 3 (control-plane PR #286, merged) and directly asserts
+  // that THIS /list-peers response is PID-filtered. Any change to this filter
+  // (or the Phase-3c re-register id-reuse, which briefly removes-then-re-adds
+  // a row) MUST be gated by running that control-plane suite — see plan §3a
+  // cross-repo verification matrix.
   return peers.filter((p) => {
     try {
       process.kill(p.pid, 0);
