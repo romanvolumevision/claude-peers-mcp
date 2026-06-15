@@ -82,18 +82,26 @@ db.run(`
     git_root TEXT,
     tty TEXT,
     profile TEXT NOT NULL DEFAULT '',
+    host TEXT NOT NULL DEFAULT '',
+    machine TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
   )
 `);
 
-// Migrate existing databases: add `profile` column if missing.
+// Migrate existing databases: add columns if missing.
 // SQLite doesn't support `ADD COLUMN IF NOT EXISTS`, so we probe pragma_table_info.
 {
   const cols = db.query("PRAGMA table_info(peers)").all() as { name: string }[];
   if (!cols.some((c) => c.name === "profile")) {
     db.run("ALTER TABLE peers ADD COLUMN profile TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "host")) {
+    db.run("ALTER TABLE peers ADD COLUMN host TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "machine")) {
+    db.run("ALTER TABLE peers ADD COLUMN machine TEXT NOT NULL DEFAULT ''");
   }
 }
 
@@ -133,8 +141,8 @@ setInterval(cleanStalePeers, 30_000);
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -218,12 +226,14 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     if (pidAlive) {
       // Refresh the mutable fields in place; KEEP the id.
       db.run(
-        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, summary = ?, last_seen = ? WHERE id = ?",
+        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, summary = ?, last_seen = ? WHERE id = ?",
         [
           body.cwd,
           body.git_root,
           body.tty,
           body.profile ?? "",
+          body.host ?? "",
+          body.machine ?? "",
           body.summary,
           now,
           existing.id,
@@ -245,6 +255,8 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     body.git_root,
     body.tty,
     body.profile ?? "",
+    body.host ?? "",
+    body.machine ?? "",
     body.summary,
     now,
     now,

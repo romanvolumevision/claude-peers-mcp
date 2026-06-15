@@ -295,6 +295,67 @@ function getTty(): string | null {
   return null;
 }
 
+// Detect the client app hosting this session, host-agnostic. tty/profile are
+// empty off-iTerm, so this gives an explicit "where am I running" signal:
+// VS Code (both the extension host and its integrated terminal), iTerm, the
+// macOS Terminal, tmux, the Claude desktop app, etc.
+function detectHost(): string {
+  const env = process.env;
+  // VS Code — extension host sets VSCODE_PID/IPC_HOOK + extensionHost marker;
+  // the integrated terminal sets TERM_PROGRAM=vscode + VSCODE_GIT_*.
+  if (
+    env.TERM_PROGRAM === "vscode" ||
+    env.VSCODE_PID ||
+    env.VSCODE_IPC_HOOK ||
+    env.VSCODE_GIT_IPC_HANDLE ||
+    env.VSCODE_CRASH_REPORTER_PROCESS_TYPE
+  ) {
+    return env.VSCODE_CRASH_REPORTER_PROCESS_TYPE === "extensionHost"
+      ? "VS Code (extension)"
+      : "VS Code";
+  }
+  if (env.TMUX) return "tmux";
+  const tp = env.TERM_PROGRAM ?? "";
+  const known: Record<string, string> = {
+    "iTerm.app": "iTerm",
+    Apple_Terminal: "Terminal",
+    WezTerm: "WezTerm",
+    Hyper: "Hyper",
+    ghostty: "Ghostty",
+    WarpTerminal: "Warp",
+  };
+  if (known[tp]) return known[tp];
+  if ((env.__CFBundleIdentifier ?? "").toLowerCase().includes("claude")) {
+    return "Claude Desktop";
+  }
+  return tp || "";
+}
+
+// Detect the physical machine. GUPPI_SURFACE (mac/apollo/openclaw) is the
+// authoritative fleet surface when present; otherwise fall back to the
+// hostname, mapped to a friendly name (MacBook / Forge) where recognisable.
+function detectMachine(): string {
+  const surface = (process.env.GUPPI_SURFACE ?? "").toLowerCase();
+  const surfaceMap: Record<string, string> = {
+    mac: "MacBook",
+    apollo: "Apollo",
+    openclaw: "OpenClaw",
+    forge: "Forge",
+  };
+  if (surface && surfaceMap[surface]) return surfaceMap[surface];
+  if (surface) return surface;
+  let h = "";
+  try {
+    h = require("os").hostname() as string;
+  } catch {
+    h = "";
+  }
+  const hl = h.toLowerCase();
+  if (hl.includes("macbook")) return "MacBook";
+  if (hl.includes("forge")) return "Forge";
+  return h.replace(/\.local$/, "");
+}
+
 // --- State ---
 
 let myId: PeerId | null = null;
@@ -304,6 +365,9 @@ let myGitRoot: string | null = null;
 // /register with the same shape after a broker loss (set once in main()).
 let myTty: string | null = null;
 let myProfile = "";
+// Host (client app) + machine — constant per process; detected once.
+const myHost = detectHost();
+const myMachine = detectMachine();
 let mySummary = "";
 
 // --- MCP Server ---
@@ -441,6 +505,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (selfTty) selfParts.push(`TTY: ${selfTty}`);
         const selfProfile = process.env.ITERM_PROFILE ?? "";
         if (selfProfile) selfParts.push(`Profile: ${selfProfile}`);
+        if (myHost) selfParts.push(`Host: ${myHost}`);
+        if (myMachine) selfParts.push(`Machine: ${myMachine}`);
         if (mySummary) selfParts.push(`Summary: ${mySummary}`);
         const selfLine = selfParts.join("\n  ");
 
@@ -464,6 +530,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
           if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.profile) parts.push(`Profile: ${p.profile}`);
+          if (p.host) parts.push(`Host: ${p.host}`);
+          if (p.machine) parts.push(`Machine: ${p.machine}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
           parts.push(`Last seen: ${p.last_seen}`);
           return parts.join("\n  ");
@@ -666,6 +734,8 @@ async function reRegister(): Promise<void> {
       git_root: myGitRoot,
       tty: myTty,
       profile: myProfile,
+      host: myHost,
+      machine: myMachine,
       summary: mySummary,
     });
     const prev = myId;
@@ -737,6 +807,8 @@ async function main() {
     git_root: myGitRoot,
     tty,
     profile,
+    host: myHost,
+    machine: myMachine,
     summary: initialSummary,
   });
   myId = reg.id;

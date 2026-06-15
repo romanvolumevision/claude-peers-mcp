@@ -8,6 +8,8 @@ export interface Peer {
   git_root: string | null;
   tty: string | null;
   profile: string; // iTerm2 dynamic-profile name (from ITERM_PROFILE env), "" if unset
+  host: string; // client app hosting the session: "VS Code", "iTerm", "Terminal", "tmux", … ("" if undetected)
+  machine: string; // physical machine: "MacBook", "Forge", … (GUPPI_SURFACE / hostname-derived; "" if undetected)
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -30,6 +32,8 @@ export interface RegisterRequest {
   git_root: string | null;
   tty: string | null;
   profile: string;
+  host?: string;
+  machine?: string;
   summary: string;
 }
 
