@@ -426,12 +426,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           exclude_id: myId,
         });
 
+        // Self-row: a session must be able to see its OWN identity. The broker
+        // excludes self (exclude_id: myId), and the CONV-10613 env/peerid-file
+        // stamps are fragile across hosts (empty GUPPI_PEER_ID + wrong-pid
+        // peerid file in the VS Code extension build). Rendering self here is
+        // host-agnostic — works identically in iTerm, VS Code, tmux, anywhere.
+        const selfParts = [
+          `ID: ${myId ?? "(registering…)"}   ← YOU (this session)`,
+          `PID: ${process.pid}`,
+          `CWD: ${myCwd}`,
+        ];
+        if (myGitRoot) selfParts.push(`Repo: ${myGitRoot}`);
+        const selfTty = getTty();
+        if (selfTty) selfParts.push(`TTY: ${selfTty}`);
+        const selfProfile = process.env.ITERM_PROFILE ?? "";
+        if (selfProfile) selfParts.push(`Profile: ${selfProfile}`);
+        if (mySummary) selfParts.push(`Summary: ${mySummary}`);
+        const selfLine = selfParts.join("\n  ");
+
         if (peers.length === 0) {
           return {
             content: [
               {
                 type: "text" as const,
-                text: `No other Claude Code instances found (scope: ${scope}).`,
+                text: `You are the only session in scope (${scope}).\n\nYOU:\n  ${selfLine}`,
               },
             ],
           };
@@ -455,7 +473,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           content: [
             {
               type: "text" as const,
-              text: `Found ${peers.length} peer(s) (scope: ${scope}):\n\n${lines.join("\n\n")}`,
+              text: `Found ${peers.length} other peer(s) (scope: ${scope}), plus YOU:\n\nYOU:\n  ${selfLine}\n\n${lines.join("\n\n")}`,
             },
           ],
         };
