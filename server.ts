@@ -369,6 +369,13 @@ let myProfile = "";
 const myHost = detectHost();
 const myMachine = detectMachine();
 let mySummary = "";
+// Auto-summary refresh state. `summaryIsAuto` stays true only while the summary
+// is broker-generated; the first explicit set_summary tool call flips it false
+// so the refresh timer NEVER overwrites a description a session set on purpose.
+// `lastSummaryContext` is the branch+recent-files signature at the last refresh,
+// so an unchanged context skips the (nano) LLM call entirely (cost guard).
+let summaryIsAuto = true;
+let lastSummaryContext = "";
 
 // --- MCP Server ---
 
@@ -604,6 +611,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
       try {
         mySummary = summary;
+        // Deliberate set → this session OWNS its description. The auto-refresh
+        // timer must never overwrite it from here on.
+        summaryIsAuto = false;
         await brokerFetch("/set-summary", { id: myId, summary });
         // CONV-10613: re-render the self-identifying tab title automatically on
         // every explicit summary change — this is the in-MCP hook that keeps
@@ -788,6 +798,9 @@ async function main() {
         git_branch: branch,
         recent_files: recentFiles,
       });
+      // Seed the refresh signature so the first timer tick doesn't re-summarize
+      // an unchanged context right after startup.
+      lastSummaryContext = `${branch ?? ""} ${recentFiles.join(",")}`;
       if (summary) {
         initialSummary = summary;
         log(`Auto-summary: ${summary}`);
@@ -897,10 +910,42 @@ async function main() {
     }
   }, HEARTBEAT_INTERVAL_MS);
 
+  // 7.5. Auto-refresh the description on a throttle so idle/silent sessions
+  // don't go stale. NEVER overwrites a summary a session set deliberately
+  // (summaryIsAuto=false), and skips the gpt-5.4-nano call when the branch +
+  // recent files are unchanged since the last refresh (cost guard → near-zero
+  // when idle). Host-agnostic: runs in every session regardless of terminal.
+  const SUMMARY_REFRESH_INTERVAL_MS = 12 * 60 * 1000; // 12 min
+  const summaryRefreshTimer = setInterval(async () => {
+    if (!summaryIsAuto || !myId) return;
+    try {
+      const branch = await getGitBranch(myCwd);
+      const recentFiles = await getRecentFiles(myCwd);
+      const sig = `${branch ?? ""} ${recentFiles.join(",")}`;
+      if (sig === lastSummaryContext) return; // unchanged → skip the LLM call
+      lastSummaryContext = sig;
+      const summary = await generateSummary({
+        cwd: myCwd,
+        git_root: myGitRoot,
+        git_branch: branch,
+        recent_files: recentFiles,
+      });
+      if (summary && summary !== mySummary) {
+        mySummary = summary;
+        await brokerFetch("/set-summary", { id: myId, summary });
+        refreshTabTitle(summary);
+        log(`Auto-refreshed summary: ${summary}`);
+      }
+    } catch (e) {
+      log(`Auto-refresh failed (non-critical): ${e instanceof Error ? e.message : String(e)}`);
+    }
+  }, SUMMARY_REFRESH_INTERVAL_MS);
+
   // 8. Clean up on exit
   const cleanup = async () => {
     clearInterval(pollTimer);
     clearInterval(heartbeatTimer);
+    clearInterval(summaryRefreshTimer);
     if (myId) {
       try {
         await brokerFetch("/unregister", { id: myId });
