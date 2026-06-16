@@ -39,6 +39,7 @@ import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
 import { resolveProfileEnv } from "./shared/profile_env";
+import { paintTmuxWindowTitle } from "./shared/tmux_paint";
 import { shouldReRegister } from "./shared/reregister";
 import type { HeartbeatResponse } from "./shared/types.ts";
 import { makeTransportCloseHandler } from "./shared/transport_close";
@@ -188,18 +189,25 @@ function readLabel(): string | undefined {
 /**
  * Re-render + emit the self-identifying tab title after a summary change. The
  * server is a bun subprocess with no iTerm2 Python API, so it (a) records the
- * new label into the marker file and (b) shells out to the AppleScript
- * `set name` leg targeting $ITERM_SESSION_ID — both bypass the profile's
- * `Allow Title Setting: false` OSC gate (CONV-8207). Fully best-effort: any
- * failure is logged and swallowed so it can never break set_summary.
+ * new label into the marker file and then drives the composed title onto
+ * whichever terminal surface this session is running under:
+ *   • iTerm2 (Mac control plane) — the AppleScript `set name` leg targeting
+ *     $ITERM_SESSION_ID, which also bypasses the profile's
+ *     `Allow Title Setting: false` OSC gate (CONV-8207).
+ *   • tmux (Forge remote-control) — `tmux rename-window` on the window owning
+ *     $TMUX_PANE, gated on $TMUX (tmux-migration §5 step 5). There is no iTerm2
+ *     over SSH/tmux, so $ITERM_SESSION_ID is empty and the iTerm leg no-ops;
+ *     this leg fills that gap.
+ * The two legs are additive and independently gated ($ITERM_SESSION_ID vs
+ * $TMUX) — on a Mac iTerm session $TMUX is unset, so behaviour is unchanged.
+ * Fully best-effort: any failure is logged and swallowed so it can never break
+ * set_summary, and neither leg blocks the other.
  */
 function refreshTabTitle(summary: string): void {
   try {
     if (myId) {
       stampPeerIdFile(process.pid, myId, resolveProfileEnv(), { LABEL: summary });
     }
-    const sessionId = process.env.ITERM_SESSION_ID ?? "";
-    if (!sessionId) return; // not in an iTerm2 session (SSH/CI/Terminal.app)
     const channel = profileToChannel(resolveProfileEnv());
     const conv = readLastConv();
     const peer = myId ?? undefined;
@@ -222,39 +230,53 @@ function refreshTabTitle(summary: string): void {
     const compact = composeCompactTitle(channel, peer, conv, summary, label);
     const sessionName = composeSessionName(channel, peer, conv, summary, label);
     const badge = composeBadge(channel, summary);
-    const uuid = sessionId.includes(":") ? sessionId.slice(sessionId.lastIndexOf(":") + 1) : sessionId;
-    // Explicit-session targeting (Roman directive 2026-05-11, CONV-8191): walk
-    // sessions by unique id rather than touching the frontmost window.
-    const applescript = [
-      "on run argv",
-      "  set targetName to item 1 of argv",
-      "  set targetUUID to item 2 of argv",
-      "  set winTitle to item 3 of argv",
-      "  set subTitle to item 4 of argv",
-      "  set badgeText to item 5 of argv",
-      '  tell application "iTerm2"',
-      "    repeat with w in windows",
-      "      repeat with t in tabs of w",
-      "        repeat with s in sessions of t",
-      "          if (unique id of s as string) is targetUUID then",
-      "            tell s",
-      "              set name to targetName",
-      '              set variable named "user.window_title" to winTitle',
-      '              set variable named "user.session_subtitle" to subTitle',
-      '              set variable named "user.badge" to badgeText',
-      "            end tell",
-      "            return",
-      "          end if",
-      "        end repeat",
-      "      end repeat",
-      "    end repeat",
-      "  end tell",
-      "end run",
-    ].join("\n");
-    Bun.spawn(["osascript", "-", compact, uuid, sessionName, sessionName, badge], {
-      stdin: new TextEncoder().encode(applescript),
-      stdout: "ignore",
-      stderr: "ignore",
+
+    // --- iTerm2 leg (Mac) — gated on $ITERM_SESSION_ID. ---
+    const sessionId = process.env.ITERM_SESSION_ID ?? "";
+    if (sessionId) {
+      const uuid = sessionId.includes(":") ? sessionId.slice(sessionId.lastIndexOf(":") + 1) : sessionId;
+      // Explicit-session targeting (Roman directive 2026-05-11, CONV-8191): walk
+      // sessions by unique id rather than touching the frontmost window.
+      const applescript = [
+        "on run argv",
+        "  set targetName to item 1 of argv",
+        "  set targetUUID to item 2 of argv",
+        "  set winTitle to item 3 of argv",
+        "  set subTitle to item 4 of argv",
+        "  set badgeText to item 5 of argv",
+        '  tell application "iTerm2"',
+        "    repeat with w in windows",
+        "      repeat with t in tabs of w",
+        "        repeat with s in sessions of t",
+        "          if (unique id of s as string) is targetUUID then",
+        "            tell s",
+        "              set name to targetName",
+        '              set variable named "user.window_title" to winTitle',
+        '              set variable named "user.session_subtitle" to subTitle',
+        '              set variable named "user.badge" to badgeText',
+        "            end tell",
+        "            return",
+        "          end if",
+        "        end repeat",
+        "      end repeat",
+        "    end repeat",
+        "  end tell",
+        "end run",
+      ].join("\n");
+      Bun.spawn(["osascript", "-", compact, uuid, sessionName, sessionName, badge], {
+        stdin: new TextEncoder().encode(applescript),
+        stdout: "ignore",
+        stderr: "ignore",
+      });
+    }
+
+    // --- tmux leg (Forge) — gated on $TMUX (tmux-migration §5 step 5). ---
+    // ADDITIVE: paints the SAME compact title the iTerm `set name` leg uses onto
+    // the tmux window owning $TMUX_PANE. Internally gated on $TMUX (no-op off
+    // tmux) and best-effort (never throws, never blocks set_summary); we don't
+    // await it so it can't slow the set_summary response.
+    void paintTmuxWindowTitle(compact, { log }).catch((e) => {
+      log(`tmux title paint failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
     });
   } catch (e) {
     log(`refreshTabTitle failed (non-fatal): ${e instanceof Error ? e.message : String(e)}`);
