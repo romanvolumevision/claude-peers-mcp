@@ -38,6 +38,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
+import { resolveProfileEnv } from "./shared/profile_env";
 import { shouldReRegister } from "./shared/reregister";
 import type { HeartbeatResponse } from "./shared/types.ts";
 import { makeTransportCloseHandler } from "./shared/transport_close";
@@ -143,7 +144,7 @@ function log(msg: string) {
  */
 function stampPeerId(id: string): void {
   process.env.GUPPI_PEER_ID = id;
-  stampPeerIdFile(process.pid, id, process.env.ITERM_PROFILE ?? "");
+  stampPeerIdFile(process.pid, id, resolveProfileEnv());
 }
 
 /** Read the channel's last_conv from workstreams/.state.json (best-effort). */
@@ -153,7 +154,7 @@ function readLastConv(): string | undefined {
     if (!projectDir) return undefined;
     const statePath = path.join(projectDir, "workstreams", ".state.json");
     const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
-    const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
+    const channel = profileToChannel(resolveProfileEnv());
     if (!channel) return undefined;
     const slice = data?.channels?.[channel];
     const conv = slice?.last_conv;
@@ -172,7 +173,7 @@ function readLabel(): string | undefined {
     if (!projectDir) return undefined;
     const statePath = path.join(projectDir, "workstreams", ".state.json");
     const data = JSON.parse(fs.readFileSync(statePath, "utf-8"));
-    const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
+    const channel = profileToChannel(resolveProfileEnv());
     if (!channel) return undefined;
     const slice = data?.channels?.[channel];
     const label = slice?.label;
@@ -195,11 +196,11 @@ function readLabel(): string | undefined {
 function refreshTabTitle(summary: string): void {
   try {
     if (myId) {
-      stampPeerIdFile(process.pid, myId, process.env.ITERM_PROFILE ?? "", { LABEL: summary });
+      stampPeerIdFile(process.pid, myId, resolveProfileEnv(), { LABEL: summary });
     }
     const sessionId = process.env.ITERM_SESSION_ID ?? "";
     if (!sessionId) return; // not in an iTerm2 session (SSH/CI/Terminal.app)
-    const channel = profileToChannel(process.env.ITERM_PROFILE ?? "");
+    const channel = profileToChannel(resolveProfileEnv());
     const conv = readLastConv();
     const peer = myId ?? undefined;
     // CONV-10613 three-field rename — kept in parity with the GUPPI daemon
@@ -510,7 +511,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (myGitRoot) selfParts.push(`Repo: ${myGitRoot}`);
         const selfTty = getTty();
         if (selfTty) selfParts.push(`TTY: ${selfTty}`);
-        const selfProfile = process.env.ITERM_PROFILE ?? "";
+        const selfProfile = resolveProfileEnv();
         if (selfProfile) selfParts.push(`Profile: ${selfProfile}`);
         if (myHost) selfParts.push(`Host: ${myHost}`);
         if (myMachine) selfParts.push(`Machine: ${myMachine}`);
@@ -773,9 +774,10 @@ async function main() {
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
   const tty = getTty();
-  // ITERM_PROFILE is set automatically by iTerm2 to the dynamic-profile name
-  // (e.g. "Blue Shadow"). Empty string for non-iTerm callers.
-  const profile = process.env.ITERM_PROFILE ?? "";
+  // Channel identity: ITERM_PROFILE (iTerm2 sets it automatically, e.g.
+  // "Blue Shadow") with a TMUX_PROFILE fallback for the Forge tmux path, ""
+  // otherwise. See shared/profile_env.ts.
+  const profile = resolveProfileEnv();
   // Open-016 Phase 3b: cache the registration context so reRegister() can
   // re-POST /register with the same shape after a broker loss.
   myTty = tty;
