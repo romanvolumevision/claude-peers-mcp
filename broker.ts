@@ -55,6 +55,17 @@ import {
   buildRelayAuditHeaders,
 } from "./relay-audit";
 import { stampPeerIdFile } from "./shared/stamp";
+import {
+  BOOT_ID_HEADER,
+  PEER_TOKEN_HEADER,
+  type BindStatus,
+  type IdentityBindMode,
+  bindingAccepts,
+  classifyBinding,
+  generatePeerToken,
+  identityBindMode,
+  isBindMismatch,
+} from "./shared/identity_bind";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BIND_HOST = process.env.CLAUDE_PEERS_BIND_HOST ?? "127.0.0.1";
@@ -67,6 +78,12 @@ const HMAC_MODE: HmacMode = ((): HmacMode => {
 })();
 const AGGREGATOR_RELAY_URL =
   process.env.GUPPI_BROKER_AUDIT_RELAY_URL ?? "http://127.0.0.1:7901/broker-audit-relay";
+
+// S1 broker hardening (GBA-7/8/9) — per-peer identity binding. Three-state,
+// DEFAULT OFF (mirrors BROKER_HMAC_MODE). off = byte-identical to today; warn =
+// observe + emit identity_mismatch; enforce = reject a mismatch for a bound
+// peer. See shared/identity_bind.ts. Read once at boot; never flipped here.
+const IDENTITY_BIND_MODE: IdentityBindMode = identityBindMode();
 
 // --- Database setup ---
 
@@ -102,6 +119,28 @@ db.run(`
   }
   if (!cols.some((c) => c.name === "machine")) {
     db.run("ALTER TABLE peers ADD COLUMN machine TEXT NOT NULL DEFAULT ''");
+  }
+  // S1 broker hardening (GBA-7/8/9) — strictly-additive identity columns via the
+  // same probe-then-ALTER idiom. NOT NULL DEFAULT '' matches the existing style:
+  // ADD COLUMN is O(1) metadata-only (does NOT rewrite existing rows), old rows
+  // get '' (= "unbound" → binding skipped), WAL + busy_timeout make it safe to
+  // run at boot against the live on-disk DB.
+  //   boot_id    — per-process id echoed to defeat PID-spoof register hijack.
+  //   token      — minted per-peer scope-token; the bind credential. NEVER
+  //                returned via /list-peers (see the explicit column lists below).
+  //   repo_id    — future repo-scoping key (stored, not yet enforced).
+  //   session_id — future session-scoping key (stored, not yet enforced).
+  if (!cols.some((c) => c.name === "boot_id")) {
+    db.run("ALTER TABLE peers ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "token")) {
+    db.run("ALTER TABLE peers ADD COLUMN token TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "repo_id")) {
+    db.run("ALTER TABLE peers ADD COLUMN repo_id TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "session_id")) {
+    db.run("ALTER TABLE peers ADD COLUMN session_id TEXT NOT NULL DEFAULT ''");
   }
 }
 
@@ -140,9 +179,18 @@ setInterval(cleanStalePeers, 30_000);
 
 // --- Prepared statements ---
 
+// Public peer columns returned to OTHER peers via /list-peers. This MUST NOT
+// include `token` (the per-peer bind secret) — a `SELECT *` would leak every
+// peer's credential to every caller. Keeping it to exactly the Peer-type fields
+// also keeps /list-peers output byte-identical to pre-GBA789 (the new columns
+// are simply never projected). boot_id/repo_id/session_id are non-secret but
+// off-contract, so they are excluded too.
+const PEER_COLUMNS =
+  "id, pid, cwd, git_root, tty, profile, host, machine, summary, registered_at, last_seen";
+
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, summary, registered_at, last_seen, boot_id, token, repo_id, session_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -158,15 +206,15 @@ const deletePeer = db.prepare(`
 `);
 
 const selectAllPeers = db.prepare(`
-  SELECT * FROM peers
+  SELECT ${PEER_COLUMNS} FROM peers
 `);
 
 const selectPeersByDirectory = db.prepare(`
-  SELECT * FROM peers WHERE cwd = ?
+  SELECT ${PEER_COLUMNS} FROM peers WHERE cwd = ?
 `);
 
 const selectPeersByGitRoot = db.prepare(`
-  SELECT * FROM peers WHERE git_root = ?
+  SELECT ${PEER_COLUMNS} FROM peers WHERE git_root = ?
 `);
 
 const insertMessage = db.prepare(`
@@ -204,13 +252,24 @@ function generateId(): string {
 // for a known live PID. A new PID still mints fresh; a dead prior PID is still
 // reaped. This is the only id-stability mechanism — the adapter does NOT
 // re-stamp a fresh id, it just re-/registers and gets the same id back.
-function handleRegister(body: RegisterRequest): RegisterResponse {
+// GBA-9/GBA-8: /register both mints the peer's scope-token (returned in the
+// response) and — on the re-register-of-a-live-PID reuse path — enforces the
+// boot_id-echo anti-hijack. The outcome is a discriminated union so the caller
+// can turn a `bootid_mismatch` in enforce mode into a 401.
+type RegisterOutcome =
+  | { ok: true; response: RegisterResponse }
+  | { ok: false; status: BindStatus };
+
+function handleRegister(body: RegisterRequest, mode: IdentityBindMode): RegisterOutcome {
   const now = new Date().toISOString();
+  const presentedBootId = body.boot_id ?? "";
+  const repoId = body.repo_id ?? "";
+  const sessionId = body.session_id ?? "";
 
   // Look up any existing registration for this PID.
-  const existing = db.query("SELECT id, pid FROM peers WHERE pid = ?").get(body.pid) as
-    | { id: string; pid: number }
-    | null;
+  const existing = db
+    .query("SELECT id, pid, token, boot_id FROM peers WHERE pid = ?")
+    .get(body.pid) as { id: string; pid: number; token: string; boot_id: string } | null;
 
   if (existing) {
     // Known PID. Reuse the id IF the process is still alive (a genuine
@@ -224,9 +283,47 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
       pidAlive = false;
     }
     if (pidAlive) {
+      // GBA-8 anti-hijack: a re-register for a live PID must echo the SAME
+      // boot_id that first registered it. PID is not secret, so an attacker who
+      // knows a victim's live PID could POST /register{pid:victimPid} and get
+      // the victim's real id back — UNLESS they also present the victim's
+      // boot_id (which they don't know). Only fires once the row is boot-bound
+      // (existing.boot_id !== ''); a legitimate re-register from the same
+      // process presents the same boot_id and passes.
+      if (mode === "enforce" && existing.boot_id !== "") {
+        if (presentedBootId !== existing.boot_id) {
+          emitAudit("identity_mismatch", {
+            path: "/register",
+            claimed_id: existing.id,
+            status: "bootid_mismatch",
+            mode,
+            phase: "reregister",
+          });
+          return { ok: false, status: "bootid_mismatch" };
+        }
+      } else if (
+        mode === "warn" &&
+        existing.boot_id !== "" &&
+        presentedBootId !== "" &&
+        presentedBootId !== existing.boot_id
+      ) {
+        emitAudit("identity_mismatch", {
+          path: "/register",
+          claimed_id: existing.id,
+          status: "bootid_mismatch",
+          mode,
+          phase: "reregister",
+        });
+      }
+
+      // Preserve the existing token (identity-stable across a broker blip); mint
+      // one if the row predates GBA-9 (stored token ''). Same for boot_id: keep
+      // the first-registered value, else adopt the presented one.
+      const token = existing.token !== "" ? existing.token : generatePeerToken();
+      const bootId = existing.boot_id !== "" ? existing.boot_id : presentedBootId;
       // Refresh the mutable fields in place; KEEP the id.
       db.run(
-        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, summary = ?, last_seen = ? WHERE id = ?",
+        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, summary = ?, last_seen = ?, token = ?, boot_id = ?, repo_id = ?, session_id = ? WHERE id = ?",
         [
           body.cwd,
           body.git_root,
@@ -236,18 +333,26 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
           body.machine ?? "",
           body.summary,
           now,
+          token,
+          bootId,
+          repoId,
+          sessionId,
           existing.id,
         ],
       );
       // Re-stamp the marker (idempotent — same filename + format).
       stampPeerIdFile(body.pid, existing.id, body.profile ?? "");
-      return { id: existing.id };
+      return { ok: true, response: { id: existing.id, token } };
     }
     // Dead PID — recycled. Drop the stale row and fall through to mint fresh.
     deletePeer.run(existing.id);
   }
 
   const id = generateId();
+  // GBA-9: mint the per-peer scope-token. Minting is unconditional (even in
+  // off mode) so the column populates and enforcement can be flipped on later
+  // without a re-register storm; the token is only VERIFIED when the flag is on.
+  const token = generatePeerToken();
   insertPeer.run(
     id,
     body.pid,
@@ -260,6 +365,10 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     body.summary,
     now,
     now,
+    presentedBootId,
+    token,
+    repoId,
+    sessionId,
   );
   // CONV-10613: pid-keyed peer-id marker backstop. server.ts also stamps from
   // inside the spawned session (the authoritative writer); this broker-side
@@ -267,7 +376,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
   // own stamp races or is skipped. Idempotent — same filename + format, so a
   // later server.ts overwrite is harmless. Best-effort; never blocks register.
   stampPeerIdFile(body.pid, id, body.profile ?? "");
-  return { id };
+  return { ok: true, response: { id, token } };
 }
 
 // Open-016 Phase 3 (CONV-10639): report whether this id is still known. The
@@ -558,6 +667,74 @@ function applyHmacMiddleware(
   return null;
 }
 
+// --- S1 identity-binding middleware (GBA-7/8/9) ---
+//
+// Binds the body-claimed actor id on a write path to the per-peer credential
+// the caller echoes (scope-token header + optional boot_id header). Gated by
+// BROKER_IDENTITY_BIND_MODE (default off = byte-identical to today). Returns a
+// 401 Response only in enforce mode on a mismatch for a BOUND peer; warn emits
+// an audit event but accepts; off short-circuits before any DB read.
+
+/** The body field carrying the actor id for each authenticated write path. */
+function claimedActorId(path: string, body: unknown): string | null {
+  const b = body as Record<string, unknown>;
+  switch (path) {
+    case "/send-message":
+    case "/kill-peer":
+      // Actor of the write. kill-peer's from_id is optional (advisory) — when
+      // absent we cannot bind it, so the check is skipped for that request.
+      return typeof b?.from_id === "string" ? b.from_id : null;
+    case "/set-summary":
+    case "/heartbeat":
+    case "/unregister":
+    case "/poll-messages":
+      return typeof b?.id === "string" ? b.id : null;
+    default:
+      return null;
+  }
+}
+
+function applyIdentityBinding(
+  req: Request,
+  path: string,
+  claimedId: string | null,
+): Response | null {
+  if (IDENTITY_BIND_MODE === "off") {
+    return null;
+  }
+  if (!claimedId) {
+    // No actor id on this path (or an absent optional actor) — nothing to bind.
+    return null;
+  }
+
+  const row = db.query("SELECT token, boot_id FROM peers WHERE id = ?").get(claimedId) as
+    | { token: string; boot_id: string }
+    | null;
+  const storedToken = row?.token ?? "";
+  const storedBootId = row?.boot_id ?? "";
+  const presentedToken = req.headers.get(PEER_TOKEN_HEADER) ?? "";
+  const presentedBootId = req.headers.get(BOOT_ID_HEADER) ?? "";
+
+  const status = classifyBinding({
+    storedToken,
+    storedBootId,
+    presentedToken,
+    presentedBootId,
+  });
+
+  if (bindingAccepts(IDENTITY_BIND_MODE, status)) {
+    // warn mode observes a mismatch but still accepts.
+    if (IDENTITY_BIND_MODE === "warn" && isBindMismatch(status)) {
+      emitAudit("identity_mismatch", { path, claimed_id: claimedId, status, mode: IDENTITY_BIND_MODE });
+    }
+    return null;
+  }
+
+  // enforce + mismatch → reject.
+  emitAudit("identity_mismatch", { path, claimed_id: claimedId, status, mode: IDENTITY_BIND_MODE });
+  return Response.json({ error: `identity binding failed: ${status}` }, { status: 401 });
+}
+
 // --- HTTP Server ---
 
 Bun.serve({
@@ -586,9 +763,28 @@ Bun.serve({
       }
       const body = JSON.parse(rawBody);
 
+      // S1 identity binding (GBA-7/8/9) — bind the body-claimed actor id to the
+      // echoed per-peer credential. /register is handled inside its own case
+      // (it needs the reuse-path boot_id anti-hijack + minting); every other
+      // write path binds here. No-op when the flag is off.
+      if (path !== "/register") {
+        const bindRejection = applyIdentityBinding(req, path, claimedActorId(path, body));
+        if (bindRejection) {
+          return bindRejection;
+        }
+      }
+
       switch (path) {
-        case "/register":
-          return Response.json(handleRegister(body as RegisterRequest));
+        case "/register": {
+          const outcome = handleRegister(body as RegisterRequest, IDENTITY_BIND_MODE);
+          if (!outcome.ok) {
+            return Response.json(
+              { error: `identity binding failed: ${outcome.status}` },
+              { status: 401 },
+            );
+          }
+          return Response.json(outcome.response);
+        }
         case "/heartbeat":
           return Response.json(handleHeartbeat(body as HeartbeatRequest));
         case "/set-summary":
@@ -617,5 +813,5 @@ Bun.serve({
 
 console.error(
   `[claude-peers broker] listening on ${BIND_HOST}:${PORT} ` +
-    `(db: ${DB_PATH}, hmac_mode: ${HMAC_MODE})`,
+    `(db: ${DB_PATH}, hmac_mode: ${HMAC_MODE}, identity_bind_mode: ${IDENTITY_BIND_MODE})`,
 );
