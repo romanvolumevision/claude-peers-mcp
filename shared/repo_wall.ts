@@ -71,15 +71,29 @@ export const ORCH_SUMMARY_PREFIX = "🐙 ORCH";
 export type RepoWallMode = "off" | "shadow" | "enforce";
 
 /**
- * Resolve the wall mode from the environment. Anything other than
- * "shadow"/"enforce" (including unset, empty, junk) resolves to "off" — the
- * safe, byte-identical-to-today default.
+ * Resolve the wall mode from the environment.
+ *
+ * Fix 3 (Sol #11 — reject invalid mode string): the parser is STRICT, not
+ * fail-safe-to-off. A silent fall-back to "off" on a typo (e.g. "enfroce")
+ * would SILENTLY DISABLE isolation — the worst possible failure for a security
+ * wall. So:
+ *   - unset / empty / whitespace  → "off"  (back-compat: a deployment that
+ *                                            never set the flag is unchanged).
+ *   - off / shadow / enforce      → that value (case-insensitive, trimmed).
+ *   - any OTHER non-empty value   → THROW, so the broker refuses to start.
+ *
+ * The broker wraps this at boot and exits with a clear message on throw.
  */
 export function repoWallMode(
   env: Record<string, string | undefined> = process.env,
 ): RepoWallMode {
-  const raw = (env[REPO_WALL_FLAG_ENV] ?? "off").trim().toLowerCase();
-  return raw === "shadow" || raw === "enforce" ? raw : "off";
+  const raw = (env[REPO_WALL_FLAG_ENV] ?? "").trim().toLowerCase();
+  if (raw === "") return "off"; // unset / empty → back-compat default
+  if (raw === "off" || raw === "shadow" || raw === "enforce") return raw;
+  throw new Error(
+    `${REPO_WALL_FLAG_ENV}="${env[REPO_WALL_FLAG_ENV]}" is not a valid mode ` +
+      `(expected one of: off, shadow, enforce)`,
+  );
 }
 
 /**
@@ -159,13 +173,38 @@ export function isOrchestrator(peer: OrchSignal): boolean {
 export interface WallParticipant {
   id: string;
   git_root: string | null;
+  /**
+   * Normalized MAIN-worktree root (CONV-10767 worktree fix). A repo and ALL its
+   * linked worktrees share ONE repo_root, so an orchestrator in the main
+   * checkout and a peer in a per-colour worktree resolve to the SAME logical
+   * repo. Optional / may be empty for LEGACY rows registered before the column
+   * existed — in that case the wall falls back to `git_root` (see
+   * {@link effectiveRepoRoot}).
+   */
+  repo_root?: string | null;
   is_orch: boolean;
 }
 
 export type WallReason =
-  | "same_repo" // ALLOW: sender & recipient share a real git_root (full mesh).
+  | "same_repo" // ALLOW: sender & recipient share a real (normalized) repo (full mesh).
   | "orch_room" // ALLOW: both are orchestrators (the cross-repo orchestrators room).
-  | "cross_repo"; // REJECT: different repos and not both orchestrators.
+  | "cross_repo" // REJECT: different repos and not both orchestrators.
+  | "unknown_participant"; // REJECT-in-enforce: a sender/recipient row is unknown/unclassifiable.
+
+/**
+ * The effective repo key for a wall comparison: the normalized `repo_root` when
+ * present (non-empty), else the raw `git_root`.
+ *
+ * This is what makes a repo and its worktrees ONE room: a worktree peer carries
+ * the MAIN repo's repo_root (its own git_root is the worktree path), while a
+ * LEGACY row that predates the column (repo_root empty/absent) still classifies
+ * by git_root — so the fallback is exactly the pre-CONV-10767 behaviour.
+ */
+export function effectiveRepoRoot(p: WallParticipant): string | null {
+  const rr = (p.repo_root ?? "").trim();
+  if (rr !== "") return rr;
+  return p.git_root;
+}
 
 export interface WallDecision {
   allow: boolean;
@@ -198,7 +237,10 @@ export function classifyWall(
   sender: WallParticipant,
   recipient: WallParticipant,
 ): WallDecision {
-  if (sameRepo(sender.git_root, recipient.git_root)) {
+  // Compare the NORMALIZED repo key (repo_root, falling back to git_root) so a
+  // repo and its linked worktrees are ONE room. This is the worktree fix: a
+  // main-checkout orch and a worktree peer of the same repo now match here.
+  if (sameRepo(effectiveRepoRoot(sender), effectiveRepoRoot(recipient))) {
     return { allow: true, reason: "same_repo" };
   }
   if (sender.is_orch && recipient.is_orch) {
@@ -245,9 +287,41 @@ export function walledSendContext(
     outcome: mode === "enforce" ? "blocked" : "would_block",
     from_id: sender.id,
     from_git_root: sender.git_root,
+    // repo_root is the NORMALIZED key the decision actually used (worktree fix) —
+    // surfaced (it is non-secret) so an operator can see WHY two toplevels that
+    // look different were, or were not, treated as one repo.
+    from_repo_root: sender.repo_root ?? null,
     from_is_orch: sender.is_orch,
     to_id: recipient.id,
     to_git_root: recipient.git_root,
+    to_repo_root: recipient.repo_root ?? null,
     to_is_orch: recipient.is_orch,
+  };
+}
+
+/**
+ * Build the structured, secret-free context for a walled send that was blocked
+ * because a participant could NOT be classified (its broker row is unknown, or
+ * it has no resolvable repo). Fix 2 (Sol #6): in enforce such a send FAILS
+ * CLOSED — we never deliver a message we can't reason about — and this line
+ * records it. As with {@link walledSendContext}: ONLY ids + known-flags + the
+ * reason + the mode; NEVER a peer token / boot_id / message text.
+ */
+export function unknownParticipantContext(
+  mode: RepoWallMode,
+  fromId: string,
+  toId: string,
+  senderKnown: boolean,
+  recipientKnown: boolean,
+): Record<string, unknown> {
+  return {
+    event: "repo_wall_blocked",
+    mode,
+    reason: "unknown_participant",
+    outcome: mode === "enforce" ? "blocked" : "would_block",
+    from_id: fromId,
+    from_known: senderKnown,
+    to_id: toId,
+    to_known: recipientKnown,
   };
 }

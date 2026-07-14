@@ -46,6 +46,13 @@ import { shouldReRegister } from "./shared/reregister";
 import type { HeartbeatResponse } from "./shared/types.ts";
 import { makeTransportCloseHandler } from "./shared/transport_close";
 import { waitForBrokerHealthy } from "./shared/wait_broker";
+// CONV-10767 worktree fix: resolveRepoRoot normalizes a repo + ALL its linked
+// worktrees to ONE logical repo_root (the MAIN working tree). A GUPPI peer runs
+// in a per-colour git WORKTREE, whose raw git_root (toplevel) is the worktree
+// path — NOT the main repo. repo_root collapses them so the broker's repo wall
+// treats an orchestrator in the main checkout and a peer in a worktree as the
+// same repo room. See shared/repo_root.ts.
+import { resolveRepoRoot } from "./shared/repo_root";
 // S1 broker hardening (GBA-7/8/9) — PR-B peer-client leg. generateBootId mints
 // this process's boot_id (GBA-8); buildIdentityHeaders emits the scope-token +
 // boot_id echo headers the broker binds against once BROKER_IDENTITY_BIND_MODE
@@ -417,6 +424,11 @@ const myBootId = generateBootId();
 let myToken = "";
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+// CONV-10767 worktree fix: the NORMALIZED main-worktree root. For a normal
+// checkout this equals myGitRoot; for a per-colour WORKTREE it is the MAIN repo
+// (so the wall keeps the worktree peer in its repo's room). Cached in main() and
+// re-presented on every /register (incl. the post-broker-blip re-register).
+let myRepoRoot: string | null = null;
 // Open-016 Phase 3b: cached registration context so reRegister() can re-POST
 // /register with the same shape after a broker loss (set once in main()).
 let myTty: string | null = null;
@@ -875,6 +887,9 @@ async function reRegister(): Promise<void> {
       pid: process.pid,
       cwd: myCwd,
       git_root: myGitRoot,
+      // CONV-10767 worktree fix: re-present the same normalized repo_root so a
+      // re-register (post broker-blip) never blanks it.
+      repo_root: myRepoRoot,
       tty: myTty,
       profile: myProfile,
       host: myHost,
@@ -915,6 +930,8 @@ async function main() {
   // 2. Gather context
   myCwd = process.cwd();
   myGitRoot = await getGitRoot(myCwd);
+  // CONV-10767 worktree fix: normalize repo + linked worktrees to one repo_root.
+  myRepoRoot = await resolveRepoRoot(myCwd, myGitRoot);
   const tty = getTty();
   // Channel identity: ITERM_PROFILE (iTerm2 sets it automatically, e.g.
   // "Blue Shadow") with a TMUX_PROFILE fallback for the Forge tmux path, ""
@@ -927,6 +944,7 @@ async function main() {
 
   log(`CWD: ${myCwd}`);
   log(`Git root: ${myGitRoot ?? "(none)"}`);
+  log(`Repo root (normalized): ${myRepoRoot ?? "(none)"}`);
   log(`TTY: ${tty ?? "(unknown)"}`);
   log(`Profile: ${profile || "(unset)"}`);
 
@@ -962,6 +980,8 @@ async function main() {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
+    // CONV-10767 worktree fix: the normalized main-worktree root (see above).
+    repo_root: myRepoRoot,
     tty,
     profile,
     host: myHost,

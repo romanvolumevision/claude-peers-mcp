@@ -34,6 +34,10 @@ const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
 const REPO_A = "/tmp/repo-wall-A";
 const REPO_B = "/tmp/repo-wall-B";
+// A LINKED WORKTREE of repo A: its own git_root (the worktree path) is DISTINCT
+// from REPO_A, but its normalized repo_root IS REPO_A. This is the exact shape a
+// GUPPI per-colour peer runs in, and the cell the naive git_root wall broke.
+const REPO_A_WORKTREE = "/tmp/repo-wall-A-worktrees/red";
 
 interface SpawnedBroker {
   proc: ReturnType<typeof Bun.spawn>;
@@ -132,6 +136,10 @@ async function post<T = unknown>(url: string, body: unknown): Promise<PostResult
 
 interface RegOpts {
   git_root: string | null;
+  // repo_root — the NORMALIZED main-worktree root (CONV-10767). Defaults to
+  // git_root (a normal checkout: repo_root === git_root); a WORKTREE peer passes
+  // a repo_root that differs from its git_root (the worktree path).
+  repo_root?: string | null;
   summary?: string;
   profile?: string;
 }
@@ -141,6 +149,7 @@ async function register(url: string, pid: number, opts: RegOpts): Promise<string
     pid,
     cwd: opts.git_root ?? "/tmp/repo-wall-none",
     git_root: opts.git_root,
+    repo_root: opts.repo_root !== undefined ? opts.repo_root : opts.git_root,
     tty: null,
     profile: opts.profile ?? "",
     summary: opts.summary ?? "worker",
@@ -166,6 +175,7 @@ async function bindOrchestrator(url: string, id: string): Promise<void> {
 interface Fleet {
   pA1: string;
   pA2: string;
+  pAw: string; // peer in a LINKED WORKTREE of repo A (git_root != REPO_A, repo_root == REPO_A)
   pB1: string;
   oA: string;
   oB: string;
@@ -178,6 +188,14 @@ interface Fleet {
 async function registerFleet(url: string): Promise<Fleet> {
   const pA1 = await register(url, 900011, { git_root: REPO_A, summary: "green legwork" });
   const pA2 = await register(url, 900012, { git_root: REPO_A, summary: "green legwork 2" });
+  // WORKTREE peer of repo A: git_root is the WORKTREE path, repo_root normalizes
+  // to REPO_A. Under raw git_root this peer would be walled off from the main
+  // checkout; the repo_root normalization is what keeps it in repo A's room.
+  const pAw = await register(url, 900013, {
+    git_root: REPO_A_WORKTREE,
+    repo_root: REPO_A,
+    summary: "green legwork (worktree)",
+  });
   const pB1 = await register(url, 900021, { git_root: REPO_B, summary: "blue legwork" });
   // Two REAL orchestrators — each registered THEN authoritatively bound. The
   // summary/profile are set too, but it is the bind (role='orchestrator') that
@@ -202,7 +220,7 @@ async function registerFleet(url: string): Promise<Fleet> {
     profile: "🐙 Orchestrator",
     summary: "🐙 ORCH (CONV-10767) — SPOOFER, never bound",
   });
-  return { pA1, pA2, pB1, oA, oB, sA };
+  return { pA1, pA2, pAw, pB1, oA, oB, sA };
 }
 
 async function send(url: string, from_id: string, to_id: string, text: string) {
@@ -231,6 +249,18 @@ const MATRIX: Cell[] = [
   { from: "oB", to: "sA", allow: false, label: "bound orch → SPOOF summary-only (REJECTED)" },
   // The spoofer is still a normal same-repo peer: sA→pA1 (both repo A) ALLOWS.
   { from: "sA", to: "pA1", allow: true, label: "spoofer→same-repo peer (still ALLOWED)" },
+  // ── WORKTREE NORMALIZATION — the cell the naive git_root wall broke ──────────
+  // pAw's git_root is the WORKTREE path (!= REPO_A) but its repo_root IS REPO_A.
+  // A main-checkout orch reaching a worktree peer of the SAME repo must ALLOW —
+  // this is the orch→peer dispatch path that enforce would otherwise sever.
+  { from: "oA", to: "pAw", allow: true, label: "main-orch → WORKTREE peer (SAME logical repo)" },
+  { from: "pAw", to: "oA", allow: true, label: "WORKTREE peer → main-orch (SAME logical repo)" },
+  // Full mesh within the repo holds across the worktree boundary too.
+  { from: "pA1", to: "pAw", allow: true, label: "main peer → WORKTREE peer (same repo)" },
+  { from: "pAw", to: "pA1", allow: true, label: "WORKTREE peer → main peer (same repo)" },
+  // But a worktree peer is still walled from a GENUINELY different repo.
+  { from: "pAw", to: "pB1", allow: false, label: "WORKTREE peer → other-repo peer (REJECTED)" },
+  { from: "pAw", to: "oB", allow: false, label: "WORKTREE peer → other-repo orch (REJECTED)" },
 ];
 
 // ── flag OFF (default) — byte-identical: every send delivers ─────────────────
@@ -380,5 +410,204 @@ describe("repo wall SHADOW — observe-only (log would-reject, still deliver)", 
     // And they carry NO secrets / message text.
     expect(wallLines.every((l) => !l.includes("token") && !l.includes("boot_id"))).toBe(true);
     expect(log).not.toContain("shadow:cross-repo peer→peer"); // message text never logged
+  });
+});
+
+// ── FIX 1 — repo_root normalization round-trips through the REAL broker ───────
+
+describe("repo_root column round-trips through the broker (Fix 1 — worktree normalize)", () => {
+  let broker: SpawnedBroker;
+  let wtId: string;
+
+  beforeAll(async () => {
+    broker = spawnBroker("off"); // storage is mode-independent
+    await waitForBroker(broker.url);
+    // Register a WORKTREE-shaped peer under the TEST's OWN (live) pid so it
+    // survives list-peers' PID-liveness filter (fake pids get reaped there).
+    wtId = await register(broker.url, process.pid, {
+      git_root: REPO_A_WORKTREE,
+      repo_root: REPO_A,
+      summary: "green legwork (worktree)",
+    });
+  });
+  afterAll(() => teardown(broker));
+
+  test("list-peers projects repo_root=REPO_A while git_root stays the worktree path", async () => {
+    const res = await post<Array<{ id: string; git_root: string | null; repo_root?: string | null }>>(
+      `${broker.url}/list-peers`,
+      { scope: "machine", cwd: REPO_A, git_root: REPO_A },
+    );
+    expect(res.status).toBe(200);
+    const wt = res.json.find((p) => p.id === wtId);
+    expect(wt).toBeTruthy();
+    // The worktree peer's raw git_root is the worktree path — DISTINCT from REPO_A.
+    expect(wt!.git_root).toBe(REPO_A_WORKTREE);
+    // …but its normalized repo_root (PUBLIC, projected in PEER_COLUMNS) collapses
+    // onto the main repo — proving the additive column round-trips broker-side.
+    expect(wt!.repo_root).toBe(REPO_A);
+  });
+});
+
+// ── FIX 2 — unknown participant fails CLOSED in enforce, observed in shadow ───
+
+describe("repo wall ENFORCE — unknown participant fails CLOSED (Fix 2, Sol #6)", () => {
+  let broker: SpawnedBroker;
+  let recipient: string;
+
+  beforeAll(async () => {
+    broker = spawnBroker("enforce");
+    await waitForBroker(broker.url);
+    recipient = await register(broker.url, 900061, { git_root: REPO_A, summary: "real recipient" });
+  });
+  afterAll(() => teardown(broker));
+
+  test("a send from an UNKNOWN sender id is DENIED (not fail-open)", async () => {
+    const res = await send(broker.url, "ghostxxx", recipient, "enforce:unknown-sender");
+    expect(res.status).toBe(200);
+    expect(res.json.ok).toBe(false);
+    expect(res.json.error).toContain("repo wall");
+    expect(res.json.error).toContain("unknown");
+  });
+
+  test("the denied unknown-sender message was NOT delivered", async () => {
+    const poll = await post<{ messages: unknown[] }>(`${broker.url}/poll-messages`, {
+      id: recipient,
+    });
+    expect(poll.status).toBe(200);
+    expect(poll.json.messages.length).toBe(0);
+  });
+
+  test("the block is logged as unknown_participant / blocked, and carries NO secrets", async () => {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      if (broker.stderr().includes("unknown_participant")) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const lines = broker
+      .stderr()
+      .split("\n")
+      .filter((l) => l.includes("repo_wall_blocked"));
+    const hit = lines.find(
+      (l) => l.includes("unknown_participant") && l.includes('"from_id":"ghostxxx"'),
+    );
+    expect(hit).toBeTruthy();
+    expect(hit!).toContain('"outcome":"blocked"');
+    expect(hit!).not.toContain("token");
+    expect(hit!).not.toContain("boot_id");
+  });
+});
+
+describe("repo wall SHADOW — unknown participant is DELIVERED but LOGGED", () => {
+  let broker: SpawnedBroker;
+  let recipient: string;
+
+  beforeAll(async () => {
+    broker = spawnBroker("shadow");
+    await waitForBroker(broker.url);
+    recipient = await register(broker.url, 900062, { git_root: REPO_A, summary: "real recipient" });
+  });
+  afterAll(() => teardown(broker));
+
+  test("an unknown-sender send is DELIVERED in shadow (observe-only)", async () => {
+    const res = await send(broker.url, "ghostyyy", recipient, "shadow:unknown-sender");
+    expect(res.status).toBe(200);
+    expect(res.json.ok).toBe(true); // shadow always delivers
+    const poll = await post<{ messages: Array<{ from_id: string }> }>(
+      `${broker.url}/poll-messages`,
+      { id: recipient },
+    );
+    expect(poll.json.messages.some((m) => m.from_id === "ghostyyy")).toBe(true);
+  });
+
+  test("but the would-block is logged as unknown_participant / would_block", async () => {
+    const deadline = Date.now() + 2000;
+    while (Date.now() < deadline) {
+      if (broker.stderr().includes("unknown_participant")) break;
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const lines = broker
+      .stderr()
+      .split("\n")
+      .filter((l) => l.includes("repo_wall_blocked"));
+    const hit = lines.find(
+      (l) => l.includes("unknown_participant") && l.includes('"from_id":"ghostyyy"'),
+    );
+    expect(hit).toBeTruthy();
+    expect(hit!).toContain('"outcome":"would_block"');
+  });
+});
+
+// ── FIX 3 — an invalid mode string makes the broker REFUSE TO START ───────────
+
+describe("repo wall INVALID MODE — broker refuses to start (Fix 3, Sol #11)", () => {
+  test("an unrecognized BROKER_REPO_WALL_MODE (typo) fails fast; /health never comes up", async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), "claude-peers-repowall-invalid-"));
+    const port = 18000 + Math.floor(Math.random() * 800);
+    const dbPath = join(tmpDir, "peers.db");
+    const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
+      env: {
+        ...process.env,
+        CLAUDE_PEERS_PORT: String(port),
+        CLAUDE_PEERS_DB: dbPath,
+        BROKER_HMAC_MODE: "off",
+        BROKER_IDENTITY_BIND_MODE: "off",
+        BROKER_REPO_WALL_MODE: "enfroce", // ← a typo of "enforce"
+        CLAUDE_PEERS_RELAY_AUDIT_ENABLED: "0",
+      },
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    // Drain stderr so we can inspect the fatal startup line.
+    let buf = "";
+    const drain = (async () => {
+      try {
+        const reader = (proc.stderr as ReadableStream<Uint8Array>).getReader();
+        const dec = new TextDecoder();
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) buf += dec.decode(value, { stream: true });
+        }
+      } catch {
+        // stream closed on exit — ignore
+      }
+    })();
+
+    // It must EXIT (not stay up serving). Guard with a timeout so a hang fails
+    // the test rather than blocking forever.
+    const exitCode = await Promise.race<number>([
+      proc.exited,
+      new Promise<number>((r) => setTimeout(() => r(-1), 5000)),
+    ]);
+    await drain;
+
+    // /health must NEVER answer — the broker never bound its port.
+    let healthReachable = false;
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/health`, {
+        signal: AbortSignal.timeout(300),
+      });
+      healthReachable = res.ok;
+    } catch {
+      healthReachable = false;
+    }
+
+    try {
+      proc.kill();
+    } catch {
+      // ignore
+    }
+    try {
+      rmSync(tmpDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+
+    expect(healthReachable).toBe(false);
+    expect(exitCode).not.toBe(-1); // it actually exited (didn't hang serving)
+    expect(exitCode).not.toBe(0); // …with a non-zero (failure) code
+    // A clear, secret-free startup error naming the bad value + the allowed set.
+    expect(buf).toContain("enfroce");
+    expect(buf.toLowerCase()).toContain("not a valid mode");
   });
 });

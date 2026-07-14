@@ -21,6 +21,14 @@ export interface Peer {
   //   slug         — deterministic short handle, e.g. "offplan-g1-uma".
   display_name: string;
   slug: string;
+  // repo_root — the NORMALIZED main-worktree root (CONV-10767 worktree fix). A
+  // repo and ALL its linked worktrees resolve to the SAME repo_root (the main
+  // working tree), so a peer running in a per-colour git WORKTREE (git_root = the
+  // worktree path) and the repo's main-checkout orchestrator classify into the
+  // SAME repo room. PUBLIC + non-secret (like display_name/slug/role) — it IS
+  // projected via /list-peers. Optional / '' for a LEGACY row that predates the
+  // column; the wall falls back to git_root in that case. NEVER a routing key.
+  repo_root?: string | null;
   // bind_orchestrator (CONV-10767) — the peer's bound role. '' for a normal peer
   // (and for any row that predates the migration); "orchestrator" once the peer
   // has authoritatively bound itself via bind_orchestrator. PUBLIC + non-secret
@@ -57,6 +65,11 @@ export interface RegisterRequest {
   // a routing key — see the Peer-type note above.
   display_name?: string;
   slug?: string;
+  // repo_root (CONV-10767 worktree fix) — the normalized main-worktree root the
+  // peer computes at registration (server.ts resolveRepoRoot). Optional +
+  // back-compat: an un-upgraded server.ts omits it; the broker stores '' and the
+  // wall falls back to git_root. Never a routing key — see the Peer-type note.
+  repo_root?: string | null;
   summary: string;
   // S1 broker hardening (GBA-7/8/9) — all optional + backward-tolerant (an
   // un-upgraded server.ts omits them; the broker stores '' and the identity
