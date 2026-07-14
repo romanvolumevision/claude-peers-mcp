@@ -33,6 +33,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { chmodSync, existsSync } from "node:fs";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -87,7 +88,25 @@ const IDENTITY_BIND_MODE: IdentityBindMode = identityBindMode();
 
 // --- Database setup ---
 
+// Fix 3(a) (audit hardening, CONV-10767): a broker-CREATED DB file holds every
+// peer's scope-token in plaintext, so lock it to owner-only (0600) at birth.
+// Capture existence BEFORE opening — bun:sqlite creates the file in the
+// constructor, so only a file WE just created is chmod'd here; a PRE-EXISTING
+// DB (including the live ~/.claude-peers.db on a launchd respawn) is left
+// untouched so we never silently re-permission an operator's file. Best-effort:
+// a chmod failure must never block broker boot. Independent of the identity-bind
+// flag (a plaintext-token DB should be owner-only in every mode).
+const dbFileExistedBeforeOpen = existsSync(DB_PATH);
 const db = new Database(DB_PATH);
+if (!dbFileExistedBeforeOpen) {
+  try {
+    chmodSync(DB_PATH, 0o600);
+  } catch (e) {
+    console.error(
+      `[claude-peers broker] could not chmod new DB to 0600: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
 db.run("PRAGMA journal_mode = WAL");
 db.run("PRAGMA busy_timeout = 3000");
 
@@ -258,9 +277,31 @@ function generateId(): string {
 // can turn a `bootid_mismatch` in enforce mode into a 401.
 type RegisterOutcome =
   | { ok: true; response: RegisterResponse }
-  | { ok: false; status: BindStatus };
+  | { ok: false; status: BindStatus }
+  | { ok: false; badRequest: string };
+
+// Fix 2 (audit hardening, CONV-10767): body.pid is untrusted JSON that flows
+// into path.join via stampPeerIdFile → markerPath(`${pid}.peerid`); a string
+// like "../../../evil" would normalise OUT of ~/.guppi/sessions and let a
+// register call write a marker anywhere. POSIX pids are positive integers;
+// 2^31-1 is a portable ceiling well above any real max_pid that still rejects
+// overflow / absurd values. Reject anything that isn't a real pid BEFORE any
+// path construction or DB lookup.
+const MAX_PID = 2 ** 31 - 1;
+function isValidPid(pid: unknown): pid is number {
+  return typeof pid === "number" && Number.isInteger(pid) && pid > 0 && pid <= MAX_PID;
+}
 
 function handleRegister(body: RegisterRequest, mode: IdentityBindMode): RegisterOutcome {
+  // Fix 2: reject a malformed / path-like pid before it can reach path.join
+  // (stampPeerIdFile) or the pid-keyed DB lookup below. Safe in ALL modes — a
+  // non-integer / negative / zero / path-like pid was never a valid register.
+  if (!isValidPid(body.pid)) {
+    return {
+      ok: false,
+      badRequest: "invalid pid: must be a positive integer within OS pid range",
+    };
+  }
   const now = new Date().toISOString();
   const presentedBootId = body.boot_id ?? "";
   const repoId = body.repo_id ?? "";
@@ -376,6 +417,12 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
   // own stamp races or is skipped. Idempotent — same filename + format, so a
   // later server.ts overwrite is harmless. Best-effort; never blocks register.
   stampPeerIdFile(body.pid, id, body.profile ?? "");
+  // Fix 4 (audit note, CONV-10767): the `token` returned here is ALSO returned
+  // at flag-off — intentionally. It is the enforce-readiness bootstrap: a peer
+  // must cache + echo its token BEFORE the operator flips enforce, otherwise the
+  // flip would mass-reject the live fleet. Returning it flag-off is inert today
+  // (no path verifies it) and is the prerequisite for a no-re-register-storm
+  // cutover. No behavior change.
   return { ok: true, response: { id, token } };
 }
 
@@ -680,9 +727,7 @@ function claimedActorId(path: string, body: unknown): string | null {
   const b = body as Record<string, unknown>;
   switch (path) {
     case "/send-message":
-    case "/kill-peer":
-      // Actor of the write. kill-peer's from_id is optional (advisory) — when
-      // absent we cannot bind it, so the check is skipped for that request.
+      // Actor of the write — the from_id claimed as the sender.
       return typeof b?.from_id === "string" ? b.from_id : null;
     case "/set-summary":
     case "/heartbeat":
@@ -690,6 +735,9 @@ function claimedActorId(path: string, body: unknown): string | null {
     case "/poll-messages":
       return typeof b?.id === "string" ? b.id : null;
     default:
+      // /kill-peer is deliberately NOT here: its from_id is advisory (and
+      // optional), so binding on it authorizes nothing. It is authorized on the
+      // TARGET's token instead — see authorizeKill (Fix 1).
       return null;
   }
 }
@@ -735,6 +783,88 @@ function applyIdentityBinding(
   return Response.json({ error: `identity binding failed: ${status}` }, { status: 401 });
 }
 
+// --- Fix 1 (audit hardening, CONV-10767): /kill-peer authorization ---
+//
+// /kill-peer was the one write path bound to NOTHING enforceable: its only
+// "actor" is the OPTIONAL, advisory from_id, so a caller could simply omit
+// from_id and evict ANY peer with ZERO credentials — even in enforce mode. A
+// kill is destructive + irreversible, so we require the caller to prove
+// authority over the TARGET: present to_id's own scope-token (and a matching
+// boot_id if the target recorded one) — exactly as /unregister binds a peer on
+// its own token before removing it. This is the target-token analog of
+// applyIdentityBinding.
+//
+//   off     — no check (byte-identical to today; short-circuits before any DB read).
+//   warn    — classify + emit an audit on a mismatch, but ALLOW the kill.
+//   enforce — reject an unauthorized kill with 403 (Forbidden — an authorization
+//             decision, distinct from the credential-binding 401s) and do NOT
+//             dispatch the signal or drop the row.
+//
+// A target with no stored token ('' — unbound / pre-upgrade) is skipped in every
+// mode (the same backward-tolerance the other paths use); a non-existent target
+// is 'unbound' too, so it passes here and handleKillPeer returns its own
+// not-found response.
+//
+// Residual (audit finding HIGH-2, ACCEPTED + documented in shared/identity_bind.ts):
+// a same-user process that can read ~/.claude-peers.db can read the target's
+// token and forge a valid kill. This fix raises the bar from zero-credential to
+// must-hold-target-token, consistent with every other write path; it does not
+// (and cannot) defend against read access to the broker's own DB file.
+function authorizeKill(req: Request, body: KillPeerRequest): Response | null {
+  if (IDENTITY_BIND_MODE === "off") {
+    return null;
+  }
+  const targetId = typeof body?.to_id === "string" ? body.to_id : null;
+  if (!targetId) {
+    // No target id on the body — handleKillPeer returns its own not-found /
+    // validation response; there is nothing to bind.
+    return null;
+  }
+
+  const row = db.query("SELECT token, boot_id FROM peers WHERE id = ?").get(targetId) as
+    | { token: string; boot_id: string }
+    | null;
+  const status = classifyBinding({
+    storedToken: row?.token ?? "",
+    storedBootId: row?.boot_id ?? "",
+    presentedToken: req.headers.get(PEER_TOKEN_HEADER) ?? "",
+    presentedBootId: req.headers.get(BOOT_ID_HEADER) ?? "",
+  });
+  const actor = typeof body?.from_id === "string" ? body.from_id : null;
+
+  if (bindingAccepts(IDENTITY_BIND_MODE, status)) {
+    // warn observes a mismatch but still allows the kill.
+    if (IDENTITY_BIND_MODE === "warn" && isBindMismatch(status)) {
+      emitAudit("kill_peer_unauthorized", {
+        path: "/kill-peer",
+        target_peer_id: targetId,
+        actor,
+        status,
+        mode: IDENTITY_BIND_MODE,
+        outcome: "warn_allowed",
+      });
+    }
+    return null;
+  }
+
+  // enforce + mismatch/missing → refuse BEFORE any process.kill / dropPeer.
+  emitAudit("kill_peer_unauthorized", {
+    path: "/kill-peer",
+    target_peer_id: targetId,
+    actor,
+    status,
+    mode: IDENTITY_BIND_MODE,
+    outcome: "rejected",
+  });
+  return Response.json(
+    {
+      ok: false,
+      error: `kill unauthorized: ${status} (present the target peer's ${PEER_TOKEN_HEADER})`,
+    },
+    { status: 403 },
+  );
+}
+
 // --- HTTP Server ---
 
 Bun.serve({
@@ -774,10 +904,24 @@ Bun.serve({
         }
       }
 
+      // Fix 1: /kill-peer is authorized on the TARGET's token (see authorizeKill),
+      // not the advisory from_id, so it is bound here rather than via the generic
+      // actor-id path above. No-op when the flag is off.
+      if (path === "/kill-peer") {
+        const killRejection = authorizeKill(req, body as KillPeerRequest);
+        if (killRejection) {
+          return killRejection;
+        }
+      }
+
       switch (path) {
         case "/register": {
           const outcome = handleRegister(body as RegisterRequest, IDENTITY_BIND_MODE);
           if (!outcome.ok) {
+            if ("badRequest" in outcome) {
+              // Fix 2: malformed pid — a client error, not an auth failure.
+              return Response.json({ error: outcome.badRequest }, { status: 400 });
+            }
             return Response.json(
               { error: `identity binding failed: ${outcome.status}` },
               { status: 401 },
