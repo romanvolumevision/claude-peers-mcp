@@ -73,7 +73,7 @@ import {
   type RepoWallMode,
   type WallParticipant,
   classifyWall,
-  isOrchestrator,
+  isBoundOrchestrator,
   isWalled,
   repoWallMode,
   wallAllows,
@@ -593,11 +593,18 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
 // classified). NOTE: `token`/`boot_id` are NEVER selected here — the wall is
 // pure routing metadata (git_root + orch signals), no credential is read.
 function loadWallParticipant(id: string): WallParticipant | null {
+  // SELECT the BOUND `role` column: it is the ONLY signal the wall trusts to
+  // decide "is this an orchestrator?". summary/profile are peer-settable and thus
+  // spoofable, so they are NOT read here — isBoundOrchestrator keys off role
+  // alone (see shared/repo_wall.ts). A peer that merely set summary="🐙 ORCH" but
+  // never called bind_orchestrator has role='' → is_orch=false → no cross-repo
+  // exception (spoof rejected). token/boot_id are never selected — the wall is
+  // pure routing metadata, no credential is read.
   const row = db
-    .query("SELECT id, git_root, summary, profile FROM peers WHERE id = ?")
-    .get(id) as { id: string; git_root: string | null; summary: string; profile: string } | null;
+    .query("SELECT id, git_root, role FROM peers WHERE id = ?")
+    .get(id) as { id: string; git_root: string | null; role: string } | null;
   if (!row) return null;
-  return { id: row.id, git_root: row.git_root, is_orch: isOrchestrator(row) };
+  return { id: row.id, git_root: row.git_root, is_orch: isBoundOrchestrator(row) };
 }
 
 // Apply THE WALL RULE to a send. Returns an ok:false refusal ONLY in enforce
