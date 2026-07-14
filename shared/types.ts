@@ -35,10 +35,24 @@ export interface RegisterRequest {
   host?: string;
   machine?: string;
   summary: string;
+  // S1 broker hardening (GBA-7/8/9) — all optional + backward-tolerant (an
+  // un-upgraded server.ts omits them; the broker stores '' and the identity
+  // binding treats an empty stored token as "unbound → skip").
+  //   boot_id    — per-process random id (GBA-8); stored + echoed to defeat the
+  //                PID-spoof /register hijack and stale-row impersonation.
+  //   repo_id    — future repo-scoping key (GBA-7); stored, not yet enforced.
+  //   session_id — future session-scoping key (GBA-7); stored, not yet enforced.
+  boot_id?: string;
+  repo_id?: string;
+  session_id?: string;
 }
 
 export interface RegisterResponse {
   id: PeerId;
+  // GBA-9 scope-token minted by the broker at /register. Optional so older
+  // consumers that only read `id` are unaffected; server.ts (PR-B) caches it
+  // and echoes it via X-Claude-Peers-Peer-Token on subsequent writes.
+  token?: string;
 }
 
 export interface HeartbeatRequest {
