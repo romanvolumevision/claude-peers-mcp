@@ -24,6 +24,7 @@ import type {
   Peer,
   RegisterResponse,
   PollMessagesResponse,
+  BindOrchestratorResponse,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -465,6 +466,7 @@ Available tools:
 - send_message: Send a message to another instance by ID
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
+- bind_orchestrator: Authoritatively bind THIS session as the orchestrator (sets your role + repo_id + boot_id on your own row and returns your authoritative peer id). Use it at orchestrator boot instead of guessing your own peer id.
 
 When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
   }
@@ -472,10 +474,13 @@ When you start, proactively call set_summary to describe what you're working on.
 
 // --- Tool definitions ---
 
-// Exported so the comms-surface contract (Open-016: exactly the 4 peer-to-peer
-// comms tools, NO kill_peer) is unit-testable without booting the stdio MCP /
-// broker (server.ts only runs main() when invoked as the entry point — see the
-// `import.meta.main` guard at the bottom).
+// Exported so the tool-surface contract is unit-testable without booting the
+// stdio MCP / broker (server.ts only runs main() when invoked as the entry point
+// — see the `import.meta.main` guard at the bottom). The surface is the 4
+// peer-to-peer comms tools PLUS the bind_orchestrator SELF-op (CONV-10767) — and
+// still NO kill_peer (peer termination remains an env-gated orchestrator-MCP
+// authority, Open-016). bind_orchestrator is not a cross-peer authority: it binds
+// only THIS session's own row, so it does not reopen the least-privilege carve.
 export const TOOLS = [
   {
     name: "list_peers",
@@ -535,6 +540,26 @@ export const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {},
+    },
+  },
+  {
+    name: "bind_orchestrator",
+    description:
+      "Authoritatively bind THIS session as the orchestrator. Sets your role to 'orchestrator' plus the given repo_id and boot_id on YOUR OWN peer row, and returns your authoritative peer_id (the id the broker assigned you at registration). Use this at orchestrator boot instead of reconstructing your own peer id from environment/tty signals. Binds only yourself — it takes no target id and cannot bind another peer.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        repo_id: {
+          type: "string" as const,
+          description: "The repo this orchestrator owns (e.g. the git repo name or root).",
+        },
+        boot_id: {
+          type: "string" as const,
+          description:
+            "This orchestrator boot's id — the boot epoch recorded on your row for restart detection / the lease model.",
+        },
+      },
+      required: ["repo_id", "boot_id"],
     },
   },
   // Open-016 (CONV-10639): `kill_peer` is intentionally NOT a comms tool. Peer
@@ -728,6 +753,48 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error checking messages: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "bind_orchestrator": {
+      const { repo_id, boot_id } = args as { repo_id: string; boot_id: string };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        // The self-only guarantee lives HERE: we send our OWN myId as the row to
+        // bind — never a caller-supplied id (the tool exposes only repo_id +
+        // boot_id). The broker stamps role=orchestrator + repo_id + boot_id on
+        // that row and echoes the authoritative peer id back. This replaces the
+        // 6-signal self-id reconstruction that caused the boot self-collision.
+        const result = await brokerFetch<BindOrchestratorResponse>("/bind-orchestrator", {
+          id: myId,
+          repo_id,
+          boot_id,
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                `Bound as orchestrator.\n  peer_id: ${result.peer_id}\n  repo_id: ${result.repo_id}\n` +
+                `  boot_id: ${result.boot_id}\n\nThis is your authoritative peer id — use it as your own id.`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error binding orchestrator: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
