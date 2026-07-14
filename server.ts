@@ -44,6 +44,13 @@ import { shouldReRegister } from "./shared/reregister";
 import type { HeartbeatResponse } from "./shared/types.ts";
 import { makeTransportCloseHandler } from "./shared/transport_close";
 import { waitForBrokerHealthy } from "./shared/wait_broker";
+// S1 broker hardening (GBA-7/8/9) — PR-B peer-client leg. generateBootId mints
+// this process's boot_id (GBA-8); buildIdentityHeaders emits the scope-token +
+// boot_id echo headers the broker binds against once BROKER_IDENTITY_BIND_MODE
+// is warn/enforce. Both are additive + backward-tolerant: an old broker ignores
+// the extra headers, and buildIdentityHeaders omits empty values so a peer that
+// has not yet captured a token sends nothing new. See shared/identity_bind.ts.
+import { generateBootId, buildIdentityHeaders } from "./shared/identity_bind";
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
@@ -71,6 +78,15 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     // Phase 0 stub — Phase 1+ will populate from caller's session_anchor.
     headers["X-Claude-Peers-Session-Anchor"] = "";
   }
+  // S1 broker hardening (GBA-8/9) — echo this peer's identity credentials on
+  // EVERY outbound POST so the broker can bind our body-claimed id (from_id/id)
+  // to the minted scope-token + boot_id. Strictly additive + inert until the
+  // broker enforces: buildIdentityHeaders omits empties (myToken is "" until the
+  // first /register response is captured), and an old broker — or the new one
+  // while BROKER_IDENTITY_BIND_MODE is off — simply ignores these headers.
+  // Harmless on /register too: the broker reads boot_id from the request BODY
+  // there (added below) and never consults the token header on that path.
+  Object.assign(headers, buildIdentityHeaders(myToken, myBootId));
   const res = await fetch(`${BROKER_URL}${path}`, {
     method: "POST",
     headers,
@@ -382,6 +398,17 @@ function detectMachine(): string {
 // --- State ---
 
 let myId: PeerId | null = null;
+// S1 broker hardening (GBA-8/9) — per-peer identity credentials.
+//   myBootId — this process's boot_id (GBA-8), minted ONCE at module load. Sent
+//     in the /register BODY (stored broker-side) and echoed on every subsequent
+//     write via buildIdentityHeaders. Constant for the process lifetime, so a
+//     re-register after a broker blip presents the SAME boot_id → identity-stable.
+//   myToken  — the scope-token (GBA-9) the broker mints and returns from
+//     /register; captured below and echoed on every write. "" until first
+//     register (or against an old broker that returns no token) → omitted by
+//     buildIdentityHeaders, keeping the peer "unbound" (accepted in every mode).
+const myBootId = generateBootId();
+let myToken = "";
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 // Open-016 Phase 3b: cached registration context so reRegister() can re-POST
@@ -770,9 +797,16 @@ async function reRegister(): Promise<void> {
       host: myHost,
       machine: myMachine,
       summary: mySummary,
+      // GBA-8: re-present the SAME boot_id so a live-PID re-register is
+      // recognised as us (the broker's anti-hijack requires the echo to match).
+      boot_id: myBootId,
     });
     const prev = myId;
     myId = reg.id;
+    // GBA-9: capture the (possibly refreshed) scope-token. The broker preserves
+    // it across a re-register, so it is normally unchanged; guard against an old
+    // broker that returns none by keeping the prior value.
+    if (reg.token) myToken = reg.token;
     stampPeerId(myId);
     if (prev && prev !== myId) {
       // Should not happen for a live PID (Phase 3c reuses the id); surface it
@@ -847,8 +881,14 @@ async function main() {
     host: myHost,
     machine: myMachine,
     summary: initialSummary,
+    // GBA-8: send this process's boot_id so the broker stores it and can later
+    // require the echo to match (defeats the PID-spoof /register hijack).
+    boot_id: myBootId,
   });
   myId = reg.id;
+  // GBA-9: capture the minted scope-token; brokerFetch echoes it on every
+  // subsequent write so this peer is "bound" once the broker enforces.
+  if (reg.token) myToken = reg.token;
   mySummary = initialSummary;
   log(`Registered as peer ${myId}`);
 
