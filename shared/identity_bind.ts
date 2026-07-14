@@ -40,6 +40,33 @@
  *
  * This module is pure/stdlib-only (node:crypto) so the classify + policy logic
  * is unit-testable without booting the broker.
+ *
+ * ───────────────────────────────────────────────────────────────────────────
+ * THREAT MODEL — what enforce mode DOES and does NOT defend against
+ * (audit finding HIGH-2, CONV-10767 — an honest, documented, ACCEPTED residual).
+ *
+ * DEFENDS AGAINST: a DIFFERENT-USER or sandboxed local process that does NOT
+ * have read access to the broker's DB file. Such a process cannot learn a
+ * victim peer's scope-token or boot_id, so in enforce mode it cannot forge a
+ * bound peer's writes (send-message / set-summary / heartbeat / unregister /
+ * poll-messages) and cannot kill a bound peer (kill-peer binds on the TARGET's
+ * token) — it holds no valid credential.
+ *
+ * DOES NOT DEFEND AGAINST: a SAME-USER process that can read ~/.claude-peers.db.
+ * The per-peer token is stored in that SQLite file in PLAINTEXT, so any process
+ * running as the broker's own user can read a target's token straight out of the
+ * DB and present it as a valid credential. This is an ACCEPTED, documented
+ * residual: the tokens are bearer credentials over a localhost broker, not a
+ * defense against an attacker who already holds the broker's on-disk state. The
+ * broker narrows the exposure by creating the DB file mode 0600 / owner-only
+ * (broker.ts Fix 3(a)), but a process running AS that owner is by definition
+ * inside the trust boundary.
+ *
+ * Net effect: the credential model raises the bar from "any local process can
+ * spoof/evict any peer with ZERO credentials" to "must present the target's
+ * token" — a meaningful reduction — WITHOUT claiming to stop a same-user
+ * attacker with DB read access. Do not represent it as the latter.
+ * ───────────────────────────────────────────────────────────────────────────
  */
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
