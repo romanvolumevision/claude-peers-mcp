@@ -67,6 +67,16 @@ import {
   identityBindMode,
   isBindMismatch,
 } from "./shared/identity_bind";
+import {
+  type RepoWallMode,
+  type WallParticipant,
+  classifyWall,
+  isOrchestrator,
+  isWalled,
+  repoWallMode,
+  wallAllows,
+  walledSendContext,
+} from "./shared/repo_wall";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BIND_HOST = process.env.CLAUDE_PEERS_BIND_HOST ?? "127.0.0.1";
@@ -85,6 +95,15 @@ const AGGREGATOR_RELAY_URL =
 // observe + emit identity_mismatch; enforce = reject a mismatch for a bound
 // peer. See shared/identity_bind.ts. Read once at boot; never flipped here.
 const IDENTITY_BIND_MODE: IdentityBindMode = identityBindMode();
+
+// Repo-scoped message walls (CONV-10767) — an INDEPENDENT feature from identity
+// binding above (separate flag, separate code path: applied at the SEND path,
+// not as a per-request credential middleware). Three-state, DEFAULT OFF (mirrors
+// BROKER_HMAC_MODE / BROKER_IDENTITY_BIND_MODE): off = byte-identical to today
+// (no wall check at all); shadow = evaluate + log a would-reject but STILL
+// DELIVER; enforce = reject a walled send. See shared/repo_wall.ts. Read once at
+// boot; never flipped here.
+const REPO_WALL_MODE: RepoWallMode = repoWallMode();
 
 // --- Database setup ---
 
@@ -506,8 +525,80 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
     return { ok: false, error: `Peer ${body.to_id} not found` };
   }
 
+  // Repo-scoped message wall (CONV-10767). No-op when the flag is off — the
+  // helper short-circuits before any extra DB read, so off mode is byte-
+  // identical to pre-CONV-10767 (target-existence check, then insert). In
+  // enforce mode a walled send returns an ok:false refusal (same shape as the
+  // target-not-found error above — a delivery refusal, NOT an auth failure) and
+  // is NOT inserted. In shadow mode it is logged but still delivered.
+  const walled = applyRepoWall(body);
+  if (walled) {
+    return walled;
+  }
+
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
   return { ok: true };
+}
+
+// --- Repo-scoped message walls (CONV-10767) ---
+//
+// Load exactly the fields the wall needs for one side of a send. Returns null
+// when the id is unknown to the broker (a missing sender/recipient row can't be
+// classified). NOTE: `token`/`boot_id` are NEVER selected here — the wall is
+// pure routing metadata (git_root + orch signals), no credential is read.
+function loadWallParticipant(id: string): WallParticipant | null {
+  const row = db
+    .query("SELECT id, git_root, summary, profile FROM peers WHERE id = ?")
+    .get(id) as { id: string; git_root: string | null; summary: string; profile: string } | null;
+  if (!row) return null;
+  return { id: row.id, git_root: row.git_root, is_orch: isOrchestrator(row) };
+}
+
+// Apply THE WALL RULE to a send. Returns an ok:false refusal ONLY in enforce
+// mode on a walled send; returns null (deliver) in every other case. Gated by
+// BROKER_REPO_WALL_MODE — off short-circuits before any lookup so the live bus
+// stays byte-identical until the flag is flipped.
+function applyRepoWall(
+  body: SendMessageRequest,
+): { ok: false; error: string } | null {
+  if (REPO_WALL_MODE === "off") {
+    return null;
+  }
+
+  const sender = loadWallParticipant(body.from_id);
+  const recipient = loadWallParticipant(body.to_id);
+  if (!sender || !recipient) {
+    // Unknown sender or recipient — nothing to classify. Fail-open: never let
+    // the wall block a send it can't reason about (recipient-not-found is
+    // already handled by handleSendMessage's own existence check).
+    return null;
+  }
+
+  const decision = classifyWall(sender, recipient);
+  if (!isWalled(decision)) {
+    // same-repo or orchestrators-room — allowed in every mode; deliver, no log.
+    return null;
+  }
+
+  // Walled send. Emit a structured, secret-free line in BOTH shadow and enforce
+  // (ids + git_roots + is_orch flags + reason + mode — NO message text, NO
+  // token/boot_id). console.error is the broker's stderr log sink (goes to the
+  // launchd broker log); emitAudit mirrors it to the aggregator relay when that
+  // is enabled (default-off), for observability parity with identity binding.
+  const context = walledSendContext(REPO_WALL_MODE, sender, recipient, decision);
+  console.error(`[claude-peers broker] repo_wall ${JSON.stringify(context)}`);
+  emitAudit("repo_wall_blocked", context);
+
+  if (!wallAllows(REPO_WALL_MODE, decision)) {
+    // enforce — refuse. Clear error to the sender; the message is NOT inserted.
+    return {
+      ok: false,
+      error: `repo wall: cross-repo delivery blocked (${decision.reason})`,
+    };
+  }
+
+  // shadow — logged as a would-reject, but STILL DELIVER.
+  return null;
 }
 
 const ALLOWED_KILL_SIGNALS = new Set(["SIGTERM", "SIGKILL", "SIGINT"]);
@@ -957,5 +1048,6 @@ Bun.serve({
 
 console.error(
   `[claude-peers broker] listening on ${BIND_HOST}:${PORT} ` +
-    `(db: ${DB_PATH}, hmac_mode: ${HMAC_MODE}, identity_bind_mode: ${IDENTITY_BIND_MODE})`,
+    `(db: ${DB_PATH}, hmac_mode: ${HMAC_MODE}, identity_bind_mode: ${IDENTITY_BIND_MODE}, ` +
+    `repo_wall_mode: ${REPO_WALL_MODE})`,
 );
