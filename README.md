@@ -113,6 +113,20 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_DB`                   | `~/.claude-peers.db` | SQLite database path                                                                                                                                                                     |
 | `OPENAI_API_KEY`                    | —                    | Enables auto-summary via gpt-5.4-nano                                                                                                                                                    |
 | `CLAUDE_PEERS_RELAY_AUDIT_ENABLED` | `0` (off)            | When truthy (`1`/`true`/`yes`/`on`, case-insensitive), the broker POSTs HMAC-signed audit envelopes to the guppi `/broker-audit-relay` receiver. Default-off until the receiver is deployed AND `CLAUDE_PEERS_HMAC_SECRET` is provisioned (Atlas #3136 / PR-A-FOLLOWUP-1). |
+| `BROKER_IDENTITY_BIND_MODE`         | `off`                | S1 per-peer identity binding (GBA-7/8/9). `off` = byte-identical to pre-GBA789 (no checks, claimed id accepted verbatim). `warn` = check + emit an `identity_mismatch` audit on a mismatch but still accept. `enforce` = reject (401) a mismatch / missing credential for a **bound** peer. Peers with an empty stored token (`''` — un-upgraded `server.ts` or a pre-migration row) are "unbound" and skipped in every mode. |
+
+### Identity-bind rollout & respawn safety
+
+The broker runs under launchd with **`KeepAlive=true`**: it execs `bun broker.ts` **from the working tree**, so any exit is respawned onto **whatever `broker.ts` is on disk at that instant**. That respawn is **uncontrolled** — it is launchd's call, not the operator's, and it can fire at any time (crash, OOM, machine wake), including **before** a controlled re-register of the peer fleet. So the "tolerance window" for un-upgraded peers can open **unchosen**: the merged broker can boot on the live DB while every existing peer is still `''`-unbound.
+
+This is safe because **the enforce-gate ordering keeps the flag `off` across that whole window**:
+
+1. **Land the broker flag-off** (this stays byte-identical — an uncontrolled respawn onto it is a non-event; proven by `identity_bind_respawn.test.ts`).
+2. **`server.ts` populates `token`/`boot_id`** (PR-B) so peers echo a credential.
+3. **Re-register the fleet** so live rows are bound.
+4. **Operator flips `warn` → `enforce`** — the only step that changes acceptance, and it is a deliberate operator action, never a respawn side effect.
+
+Because an uncontrolled respawn only ever re-execs the same on-disk `broker.ts` with the same env (flag still `off`), it **cannot** advance that sequence on its own. The respawn proof (`identity_bind_respawn.test.ts`) demonstrates it end-to-end: kill broker-A, respawn broker-B from the same merged `broker.ts` on the same DB, and existing peers are still accepted **byte-identically** — `/list-peers` reads back byte-for-byte, a forged `from_id` still flows (200), messages still deliver, and no `token`/`boot_id`/`repo_id`/`session_id` column is ever leaked.
 
 ## Requirements
 
