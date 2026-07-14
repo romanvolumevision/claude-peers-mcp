@@ -16,10 +16,12 @@ import {
   REPO_WALL_FLAG_ENV,
   type WallParticipant,
   classifyWall,
+  effectiveRepoRoot,
   isOrchestrator,
   isWalled,
   repoWallMode,
   sameRepo,
+  unknownParticipantContext,
   wallAllows,
   walledSendContext,
 } from "../shared/repo_wall.ts";
@@ -35,13 +37,31 @@ describe("repoWallMode() — default-off three-state flag", () => {
     expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "Shadow" })).toBe("shadow");
   });
 
-  test("junk / empty / unknown resolves to off (fail-safe)", () => {
+  test("unset / empty / whitespace resolves to off (back-compat default)", () => {
+    // Fix 3 (Sol #11): unset & empty MUST stay back-compat (off) so an existing
+    // deployment that never set the flag is byte-identical to today.
+    expect(repoWallMode({})).toBe("off");
     expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "" })).toBe("off");
-    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "1" })).toBe("off");
-    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "yes" })).toBe("off");
-    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "on" })).toBe("off");
-    // "warn" is the identity-bind vocabulary, NOT the wall's — must NOT leak in.
-    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "warn" })).toBe("off");
+    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "   " })).toBe("off");
+  });
+
+  test("off is an EXPLICITLY recognized value (not just the fall-through)", () => {
+    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: "off" })).toBe("off");
+    expect(repoWallMode({ [REPO_WALL_FLAG_ENV]: " OFF " })).toBe("off");
+  });
+
+  test("an UNRECOGNIZED non-empty value FAILS FAST (never silently falls back to off)", () => {
+    // Fix 3 (Sol #11): silently mapping junk → off would DISABLE isolation on a
+    // typo (e.g. "enfroce"). The parser must throw so the broker refuses to start.
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "enfroce" })).toThrow();
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "1" })).toThrow();
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "yes" })).toThrow();
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "on" })).toThrow();
+    // "warn" is the identity-bind vocabulary, NOT the wall's — a mistake, so throw.
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "warn" })).toThrow();
+    // The message names the offending value + the allowed set (no secrets).
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "enfroce" })).toThrow(/enfroce/);
+    expect(() => repoWallMode({ [REPO_WALL_FLAG_ENV]: "enfroce" })).toThrow(/enforce/);
   });
 });
 
@@ -94,6 +114,77 @@ describe("sameRepo() — real-repo room equality", () => {
     expect(sameRepo(null, "/repo/a")).toBe(false);
     expect(sameRepo("/repo/a", null)).toBe(false);
     expect(sameRepo("", "/repo/a")).toBe(false);
+  });
+});
+
+describe("effectiveRepoRoot() — normalized repo_root wins, git_root is the fallback", () => {
+  test("a populated repo_root is the effective key (worktree normalization)", () => {
+    // A worktree peer: git_root is the WORKTREE path, repo_root is the MAIN repo.
+    const wt: WallParticipant = {
+      id: "wt",
+      git_root: "/repo/guppi-worktrees/red",
+      repo_root: "/repo/guppi",
+      is_orch: false,
+    };
+    expect(effectiveRepoRoot(wt)).toBe("/repo/guppi");
+  });
+
+  test("an empty / missing repo_root falls back to git_root (legacy rows)", () => {
+    expect(effectiveRepoRoot({ id: "x", git_root: "/repo/g", is_orch: false })).toBe("/repo/g");
+    expect(
+      effectiveRepoRoot({ id: "x", git_root: "/repo/g", repo_root: "", is_orch: false }),
+    ).toBe("/repo/g");
+    expect(
+      effectiveRepoRoot({ id: "x", git_root: "/repo/g", repo_root: "   ", is_orch: false }),
+    ).toBe("/repo/g");
+    expect(
+      effectiveRepoRoot({ id: "x", git_root: "/repo/g", repo_root: null, is_orch: false }),
+    ).toBe("/repo/g");
+  });
+});
+
+describe("classifyWall() — WORKTREE NORMALIZATION (the cell that was broken)", () => {
+  const REPO = "/repo/guppi";
+  const WT = "/repo/guppi-worktrees/red";
+  const OTHER = "/repo/offplan";
+
+  // A main-checkout orchestrator: git_root == repo_root == the repo.
+  const orchMain: WallParticipant = { id: "o", git_root: REPO, repo_root: REPO, is_orch: true };
+  // A peer in a per-colour WORKTREE: git_root is the worktree, repo_root is main.
+  const wtPeer: WallParticipant = { id: "wt", git_root: WT, repo_root: REPO, is_orch: false };
+  // A same-repo main peer.
+  const mainPeer: WallParticipant = { id: "p", git_root: REPO, repo_root: REPO, is_orch: false };
+  // A peer in a DIFFERENT repo.
+  const otherPeer: WallParticipant = {
+    id: "z",
+    git_root: OTHER,
+    repo_root: OTHER,
+    is_orch: false,
+  };
+
+  test("main-checkout orch ↔ WORKTREE peer: ALLOW (same logical repo via repo_root)", () => {
+    // Under raw git_root this would REJECT (different toplevels). Normalization
+    // collapses them to the same room.
+    expect(classifyWall(orchMain, wtPeer)).toEqual({ allow: true, reason: "same_repo" });
+    expect(classifyWall(wtPeer, orchMain)).toEqual({ allow: true, reason: "same_repo" });
+  });
+
+  test("main peer ↔ WORKTREE peer of the same repo: ALLOW", () => {
+    expect(classifyWall(mainPeer, wtPeer).allow).toBe(true);
+    expect(classifyWall(wtPeer, mainPeer).allow).toBe(true);
+  });
+
+  test("WORKTREE peer ↔ a genuinely different repo: still REJECT", () => {
+    expect(classifyWall(wtPeer, otherPeer)).toEqual({ allow: false, reason: "cross_repo" });
+    expect(classifyWall(otherPeer, wtPeer).allow).toBe(false);
+  });
+
+  test("legacy main orch (repo_root='') ↔ worktree peer still ALLOW via git_root fallback", () => {
+    // During the mixed-deploy window the orch row may predate repo_root: it
+    // falls back to git_root (== REPO, since the orch runs in the main checkout),
+    // which still matches the worktree peer's normalized repo_root.
+    const legacyOrch: WallParticipant = { id: "lo", git_root: REPO, repo_root: "", is_orch: true };
+    expect(classifyWall(legacyOrch, wtPeer).allow).toBe(true);
   });
 });
 
@@ -200,9 +291,9 @@ describe("isWalled() + walledSendContext() — the log/audit line", () => {
     expect(isWalled({ allow: true, reason: "orch_room" })).toBe(false);
   });
 
-  test("context carries ids/git_roots/is_orch/reason/mode — and NO secrets", () => {
-    const sender: WallParticipant = { id: "pA", git_root: A, is_orch: false };
-    const recipient: WallParticipant = { id: "pB", git_root: B, is_orch: false };
+  test("context carries ids/git_roots/repo_roots/is_orch/reason/mode — and NO secrets", () => {
+    const sender: WallParticipant = { id: "pA", git_root: A, repo_root: A, is_orch: false };
+    const recipient: WallParticipant = { id: "pB", git_root: B, repo_root: B, is_orch: false };
     const decision = classifyWall(sender, recipient);
     const shadowCtx = walledSendContext("shadow", sender, recipient, decision);
     expect(shadowCtx).toEqual({
@@ -212,15 +303,41 @@ describe("isWalled() + walledSendContext() — the log/audit line", () => {
       outcome: "would_block",
       from_id: "pA",
       from_git_root: A,
+      from_repo_root: A,
       from_is_orch: false,
       to_id: "pB",
       to_git_root: B,
+      to_repo_root: B,
       to_is_orch: false,
     });
     // enforce flips only the outcome label.
     expect(walledSendContext("enforce", sender, recipient, decision).outcome).toBe("blocked");
     // Guard: the serialized line must never carry a token / boot_id / message text.
     const serialized = JSON.stringify(shadowCtx);
+    expect(serialized).not.toContain("token");
+    expect(serialized).not.toContain("boot_id");
+    expect(serialized).not.toContain("text");
+  });
+});
+
+describe("unknownParticipantContext() — the deny-unknown-in-enforce log line", () => {
+  test("carries ids + known-flags, outcome=blocked in enforce / would_block in shadow", () => {
+    const enforceCtx = unknownParticipantContext("enforce", "ghost", "pB", false, true);
+    expect(enforceCtx).toEqual({
+      event: "repo_wall_blocked",
+      mode: "enforce",
+      reason: "unknown_participant",
+      outcome: "blocked",
+      from_id: "ghost",
+      from_known: false,
+      to_id: "pB",
+      to_known: true,
+    });
+    expect(unknownParticipantContext("shadow", "ghost", "pB", false, true).outcome).toBe(
+      "would_block",
+    );
+    // No secrets / message text ever.
+    const serialized = JSON.stringify(enforceCtx);
     expect(serialized).not.toContain("token");
     expect(serialized).not.toContain("boot_id");
     expect(serialized).not.toContain("text");

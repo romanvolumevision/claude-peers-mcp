@@ -70,12 +70,14 @@ import {
   isBindMismatch,
 } from "./shared/identity_bind";
 import {
+  REPO_WALL_FLAG_ENV,
   type RepoWallMode,
   type WallParticipant,
   classifyWall,
   isBoundOrchestrator,
   isWalled,
   repoWallMode,
+  unknownParticipantContext,
   wallAllows,
   walledSendContext,
 } from "./shared/repo_wall";
@@ -105,7 +107,26 @@ const IDENTITY_BIND_MODE: IdentityBindMode = identityBindMode();
 // (no wall check at all); shadow = evaluate + log a would-reject but STILL
 // DELIVER; enforce = reject a walled send. See shared/repo_wall.ts. Read once at
 // boot; never flipped here.
-const REPO_WALL_MODE: RepoWallMode = repoWallMode();
+//
+// Fix 3 (Sol #11 — reject invalid mode string): repoWallMode() is STRICT and
+// THROWS on an unrecognized non-empty value (e.g. a "enfroce" typo) rather than
+// silently falling back to off — a silent fallback would DISABLE isolation on a
+// typo, the worst failure for a security wall. We catch that throw here and
+// REFUSE TO START with a clear, secret-free one-line error + a non-zero exit, so
+// an operator sees the misconfiguration immediately instead of a silently-open
+// broker. process.exit() is `never`, so REPO_WALL_MODE is always a valid mode.
+const REPO_WALL_MODE: RepoWallMode = resolveRepoWallModeOrExit();
+function resolveRepoWallModeOrExit(): RepoWallMode {
+  try {
+    return repoWallMode();
+  } catch (e) {
+    console.error(
+      `[claude-peers broker] FATAL: refusing to start — ${e instanceof Error ? e.message : String(e)}. ` +
+        `Set ${REPO_WALL_FLAG_ENV} to one of: off, shadow, enforce (or leave it unset).`,
+    );
+    process.exit(1);
+  }
+}
 
 // --- Database setup ---
 
@@ -143,6 +164,7 @@ db.run(`
     machine TEXT NOT NULL DEFAULT '',
     display_name TEXT NOT NULL DEFAULT '',
     slug TEXT NOT NULL DEFAULT '',
+    repo_root TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
@@ -173,6 +195,17 @@ db.run(`
   }
   if (!cols.some((c) => c.name === "slug")) {
     db.run("ALTER TABLE peers ADD COLUMN slug TEXT NOT NULL DEFAULT ''");
+  }
+  // CONV-10767 worktree fix — strictly-additive `repo_root` column via the same
+  // probe-then-ALTER idiom as host/machine/display_name/slug/role. NOT NULL
+  // DEFAULT '' → a LEGACY row (registered before this column existed) reads '' =
+  // "no normalized root", and the wall falls back to that row's git_root
+  // (shared/repo_wall.ts effectiveRepoRoot) — byte-identical to the pre-fix
+  // git_root wall for un-upgraded rows. New registrations carry the NORMALIZED
+  // main-worktree root so a repo + all its linked worktrees are ONE room. PUBLIC
+  // + non-secret (like display_name/slug/role) → IS projected in PEER_COLUMNS.
+  if (!cols.some((c) => c.name === "repo_root")) {
+    db.run("ALTER TABLE peers ADD COLUMN repo_root TEXT NOT NULL DEFAULT ''");
   }
   // S1 broker hardening (GBA-7/8/9) — strictly-additive identity columns via the
   // same probe-then-ALTER idiom. NOT NULL DEFAULT '' matches the existing style:
@@ -258,12 +291,16 @@ setInterval(cleanStalePeers, 30_000);
 // via /list-peers. It defaults '' (→ omitted from any render), keeping output
 // byte-identical for an unbound peer. token/boot_id/repo_id/session_id remain
 // OUT of this list (secret or off-contract — see the leak-regression tests).
+// CONV-10767 worktree fix adds `repo_root` here: PUBLIC + non-secret (like
+// display_name/slug/role), it IS projected so peers can see the normalized repo
+// room. Defaults '' (→ omitted from any render / falls back to git_root in the
+// wall), keeping output back-compat for a legacy row.
 const PEER_COLUMNS =
-  "id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, role, summary, registered_at, last_seen";
+  "id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, repo_root, role, summary, registered_at, last_seen";
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, summary, registered_at, last_seen, boot_id, token, repo_id, session_id)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, repo_root, summary, registered_at, last_seen, boot_id, token, repo_id, session_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -364,6 +401,10 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
   // (byte-identical to today). Display-only; never consulted for routing.
   const displayName = body.display_name ?? "";
   const slug = body.slug ?? "";
+  // CONV-10767 worktree fix — the normalized main-worktree root. Coerce a
+  // null/absent value to '' (the column is NOT NULL DEFAULT ''); an un-upgraded
+  // server.ts omits it → '' → the wall falls back to git_root for that row.
+  const repoRoot = body.repo_root ?? "";
 
   // Look up any existing registration for this PID.
   const existing = db
@@ -425,7 +466,7 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
       // broker blip that lands on the reuse path) never BLANKS a peer's readable
       // name — the peer re-presents the same values it cached from its env.
       db.run(
-        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, display_name = ?, slug = ?, summary = ?, last_seen = ?, token = ?, boot_id = ?, repo_id = ?, session_id = ? WHERE id = ?",
+        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, display_name = ?, slug = ?, repo_root = ?, summary = ?, last_seen = ?, token = ?, boot_id = ?, repo_id = ?, session_id = ? WHERE id = ?",
         [
           body.cwd,
           body.git_root,
@@ -435,6 +476,9 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
           body.machine ?? "",
           displayName,
           slug,
+          // CONV-10767: refresh repo_root in place so a re-register (or a broker
+          // blip landing on the reuse path) never BLANKS the normalized root.
+          repoRoot,
           body.summary,
           now,
           token,
@@ -468,6 +512,7 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
     body.machine ?? "",
     displayName,
     slug,
+    repoRoot,
     body.summary,
     now,
     now,
@@ -600,11 +645,22 @@ function loadWallParticipant(id: string): WallParticipant | null {
   // never called bind_orchestrator has role='' → is_orch=false → no cross-repo
   // exception (spoof rejected). token/boot_id are never selected — the wall is
   // pure routing metadata, no credential is read.
+  // CONV-10767 worktree fix: ALSO select the NORMALIZED repo_root. The wall
+  // compares repo_root (falling back to git_root for a legacy '' row), so a
+  // repo + all its linked worktrees classify into ONE room — a main-checkout
+  // orch and a per-colour worktree peer are no longer walled apart.
   const row = db
-    .query("SELECT id, git_root, role FROM peers WHERE id = ?")
-    .get(id) as { id: string; git_root: string | null; role: string } | null;
+    .query("SELECT id, git_root, repo_root, role FROM peers WHERE id = ?")
+    .get(id) as
+    | { id: string; git_root: string | null; repo_root: string | null; role: string }
+    | null;
   if (!row) return null;
-  return { id: row.id, git_root: row.git_root, is_orch: isBoundOrchestrator(row) };
+  return {
+    id: row.id,
+    git_root: row.git_root,
+    repo_root: row.repo_root,
+    is_orch: isBoundOrchestrator(row),
+  };
 }
 
 // Apply THE WALL RULE to a send. Returns an ok:false refusal ONLY in enforce
@@ -621,9 +677,32 @@ function applyRepoWall(
   const sender = loadWallParticipant(body.from_id);
   const recipient = loadWallParticipant(body.to_id);
   if (!sender || !recipient) {
-    // Unknown sender or recipient — nothing to classify. Fail-open: never let
-    // the wall block a send it can't reason about (recipient-not-found is
-    // already handled by handleSendMessage's own existence check).
+    // Fix 2 (Sol #6 — unknown participant must FAIL CLOSED in enforce): a
+    // sender/recipient row we can't classify (missing row, or no resolvable
+    // repo) must NOT bypass the wall. The prior code fail-OPENED here (returned
+    // null → delivered), which let an unknown from_id slip past enforce. Now:
+    //   enforce → DENY (block + structured reason);
+    //   shadow  → deliver but log a would-block;
+    //   off     → already short-circuited above (never reaches here).
+    // Recipient-not-found is still separately handled by handleSendMessage's own
+    // existence check; this closes the UNKNOWN-SENDER hole (from_id is never
+    // existence-checked elsewhere).
+    const context = unknownParticipantContext(
+      REPO_WALL_MODE,
+      body.from_id,
+      body.to_id,
+      !!sender,
+      !!recipient,
+    );
+    console.error(`[claude-peers broker] repo_wall ${JSON.stringify(context)}`);
+    emitAudit("repo_wall_blocked", context);
+    if (REPO_WALL_MODE === "enforce") {
+      return {
+        ok: false,
+        error: "repo wall: unknown participant blocked (unknown_participant)",
+      };
+    }
+    // shadow — observed as a would-block, but STILL DELIVER.
     return null;
   }
 
