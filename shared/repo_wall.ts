@@ -25,6 +25,13 @@
  * its own repo's peers + ALL other orchestrators; a peer can NEVER reach
  * another repo's peers or orch.
  *
+ * "S is orch" here means a BOUND orchestrator — {@link isBoundOrchestrator},
+ * which trusts ONLY the server-owned `role='orchestrator'` column stamped by the
+ * `bind_orchestrator` self-op. It does NOT trust the peer-settable summary tag or
+ * iTerm profile: those are a display fallback ({@link isOrchestrator}) but never
+ * the enforcement signal, because the cross-repo "orchestrators room" is a
+ * privilege a peer must not be able to grant itself by writing its own summary.
+ *
  * ── ROLLOUT — three-state, DEFAULT OFF ──────────────────────────────────────
  * This is an INDEPENDENT feature from the S1 identity-binding work
  * (BROKER_IDENTITY_BIND_MODE, shared/identity_bind.ts): a separate flag and a
@@ -50,10 +57,14 @@ import { profileToChannel } from "./tabtitle.ts";
 export const REPO_WALL_FLAG_ENV = "BROKER_REPO_WALL_MODE";
 
 /**
- * The summary tag convention that marks an orchestrator session. A session whose
- * summary starts with this prefix (e.g. "🐙 ORCH …" or "🐙 ORCHESTRATOR …") is
- * treated as an orchestrator. This is the just-added tag convention and is the
- * fallback signal when no explicit role/profile signal is present.
+ * The summary tag convention that marks an orchestrator session for DISPLAY. A
+ * session whose summary starts with this prefix (e.g. "🐙 ORCH …" or
+ * "🐙 ORCHESTRATOR …") is LABELLED an orchestrator by {@link isOrchestrator}.
+ *
+ * IMPORTANT: this is a peer-settable string (set_summary), so it is a DISPLAY
+ * fallback ONLY — it is NOT trusted for wall enforcement. The wall keys off the
+ * unspoofable bound `role` column via {@link isBoundOrchestrator}. Kept here for
+ * back-compat labelling of un-bound legacy rows.
  */
 export const ORCH_SUMMARY_PREFIX = "🐙 ORCH";
 
@@ -89,33 +100,57 @@ export interface OrchSignal {
 }
 
 /**
- * Identify an orchestrator peer, robustly and back-compat, in priority order:
+ * Enforcement-grade orchestrator test — the AUTHORITATIVE signal the repo wall
+ * keys off. Trusts ONLY the server-owned BOUND `role` column, which is written
+ * exclusively by the `bind_orchestrator` self-op (see broker.ts): a session can
+ * only ever bind ITSELF, and the server owns the row, so `role='orchestrator'`
+ * is unspoofable in a way a summary/profile never can be.
  *
- *   1. Explicit field (forward-compat / dormant today): a truthy `is_orch`, or
- *      `role === "orchestrator"`. If a future registration carries an explicit
- *      orchestrator signal it wins with no change here.
+ * This is DELIBERATELY stricter than {@link isOrchestrator}: it does NOT fall
+ * back to the `summary` tag or the iTerm2 `profile`. Both of those are set BY the
+ * peer on itself (set_summary / a self-chosen profile name), so a peer could set
+ * summary="🐙 ORCH …" and — under the old wall — inherit the cross-repo
+ * "orchestrators room" privilege it never earned. The wall's exception is a
+ * privilege, so it must key off a signal the peer cannot forge.
+ *
+ * Consequence (intended, and pinned by tests): a peer that sets summary="🐙 ORCH"
+ * but never calls `bind_orchestrator` has role='' → is NOT a bound orchestrator →
+ * gets NO cross-repo exception (the spoof is rejected). A legacy orchestrator
+ * simply calls `bind_orchestrator` once to earn the bound role.
+ */
+export function isBoundOrchestrator(peer: OrchSignal): boolean {
+  return typeof peer.role === "string" && peer.role.trim().toLowerCase() === "orchestrator";
+}
+
+/**
+ * Display-grade orchestrator test — identify an orchestrator peer robustly and
+ * back-compat, in priority order, for RENDERING / observability (NOT for wall
+ * enforcement, which uses {@link isBoundOrchestrator} above):
+ *
+ *   1. Bound / explicit field: a truthy `is_orch`, or `role === "orchestrator"`
+ *      (the authoritative bound signal — identical to {@link isBoundOrchestrator}).
  *   2. iTerm2 dynamic-profile: profileToChannel(profile) === "orchestrator".
  *      The orchestrator tab runs under the "🐙 Orchestrator" dynamic profile,
- *      which the broker already stores per peer — a reliable, registration-
- *      carried explicit signal (reuses the existing tabtitle helper).
- *   3. Summary tag convention (the live working fallback): summary starts with
- *      {@link ORCH_SUMMARY_PREFIX} ("🐙 ORCH", which also matches
- *      "🐙 ORCHESTRATOR").
+ *      which the broker already stores per peer.
+ *   3. Summary tag convention (the display fallback for un-bound legacy rows):
+ *      summary starts with {@link ORCH_SUMMARY_PREFIX} ("🐙 ORCH", which also
+ *      matches "🐙 ORCHESTRATOR").
  *
- * A row carrying NONE of these signals is a normal (non-orch) peer — so an
- * un-tagged legacy row is simply "not an orchestrator" and the wall still holds.
+ * NOTE ON TRUST: steps 2 and 3 are peer-settable, so they are a DISPLAY fallback
+ * only — good enough to label an un-bound legacy row in a list, but NOT trusted
+ * for the wall's cross-repo privilege. Enforcement trusts the bound role alone
+ * ({@link isBoundOrchestrator}). A row carrying none of these signals is a normal
+ * (non-orch) peer.
  */
 export function isOrchestrator(peer: OrchSignal): boolean {
-  // 1. Explicit forward-compat field.
+  // 1. Bound / explicit field (the authoritative signal — see isBoundOrchestrator).
   if (peer.is_orch === true || peer.is_orch === 1) return true;
-  if (typeof peer.role === "string" && peer.role.trim().toLowerCase() === "orchestrator") {
-    return true;
-  }
-  // 2. iTerm2 dynamic-profile signal.
+  if (isBoundOrchestrator(peer)) return true;
+  // 2. iTerm2 dynamic-profile signal (display fallback).
   if (typeof peer.profile === "string" && profileToChannel(peer.profile) === "orchestrator") {
     return true;
   }
-  // 3. Summary tag convention.
+  // 3. Summary tag convention (display fallback for un-bound legacy rows).
   const summary = (peer.summary ?? "").trim();
   return summary.startsWith(ORCH_SUMMARY_PREFIX);
 }

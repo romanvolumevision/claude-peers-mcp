@@ -7,16 +7,20 @@
  * those layers, and the audit relay is kept inert (default-off) so the only
  * observable side-effect is the broker's stderr log line.
  *
- * Synthetic fleet — 2 repos × {peers, orchestrator}:
+ * Synthetic fleet — 2 repos × {peers, orchestrator} + a spoofer:
  *   pA1, pA2  peers in repo A
  *   pB1       peer  in repo B
- *   oA        orchestrator in repo A (tagged via the "🐙 ORCH" summary convention)
- *   oB        orchestrator in repo B (tagged via the "🐙 Orchestrator" iTerm profile)
- * (oA + oB deliberately use the two DIFFERENT orchestrator signals so both are
- *  proven through the real broker.)
+ *   oA        orchestrator in repo A — BOUND via POST /bind-orchestrator (role='orchestrator')
+ *   oB        orchestrator in repo B — BOUND via POST /bind-orchestrator (role='orchestrator')
+ *   sA        SPOOFER in repo A — sets summary="🐙 ORCH …" (and even the iTerm
+ *             "🐙 Orchestrator" profile) but NEVER calls bind_orchestrator, so
+ *             role='' — proves the wall trusts the BOUND role column, not the
+ *             peer-settable summary/profile.
  *
  * THE WALL RULE proven here (sender → recipient):
- *   ALLOW iff (same git_root) OR (both orchestrators); else REJECT.
+ *   ALLOW iff (same git_root) OR (both BOUND orchestrators); else REJECT.
+ * The orchestrators-room exception keys off the server-owned role column: a peer
+ * that merely tags its own summary "🐙 ORCH" gains NO cross-repo reach.
  *
  * Run: bun test repo_wall_integration.test.ts
  */
@@ -146,34 +150,59 @@ async function register(url: string, pid: number, opts: RegOpts): Promise<string
   return res.json.id;
 }
 
+// Authoritatively BIND a peer as an orchestrator — the server-owned self-op that
+// stamps role='orchestrator' on that row. This (not the summary/profile) is the
+// signal the wall trusts. Returns nothing; asserts the bind acknowledged.
+async function bindOrchestrator(url: string, id: string): Promise<void> {
+  const res = await post<{ peer_id: string }>(`${url}/bind-orchestrator`, {
+    id,
+    repo_id: "",
+    boot_id: "",
+  });
+  expect(res.status).toBe(200);
+  expect(res.json.peer_id).toBe(id);
+}
+
 interface Fleet {
   pA1: string;
   pA2: string;
   pB1: string;
   oA: string;
   oB: string;
+  sA: string;
 }
 
 // Distinct FAKE pids — fresh-mint each (no reuse path). Send-message target
 // checks + wall lookups don't liveness-probe, so the rows persist for the
 // (sub-30s) test without being reaped by cleanStalePeers.
 async function registerFleet(url: string): Promise<Fleet> {
-  return {
-    pA1: await register(url, 900011, { git_root: REPO_A, summary: "green legwork" }),
-    pA2: await register(url, 900012, { git_root: REPO_A, summary: "green legwork 2" }),
-    pB1: await register(url, 900021, { git_root: REPO_B, summary: "blue legwork" }),
-    // orch via the summary tag convention:
-    oA: await register(url, 900031, {
-      git_root: REPO_A,
-      summary: "🐙 ORCH (CONV-10767) — repoA fleet",
-    }),
-    // orch via the iTerm2 dynamic-profile signal (empty/plain summary):
-    oB: await register(url, 900041, {
-      git_root: REPO_B,
-      profile: "🐙 Orchestrator",
-      summary: "coordinating repoB",
-    }),
-  };
+  const pA1 = await register(url, 900011, { git_root: REPO_A, summary: "green legwork" });
+  const pA2 = await register(url, 900012, { git_root: REPO_A, summary: "green legwork 2" });
+  const pB1 = await register(url, 900021, { git_root: REPO_B, summary: "blue legwork" });
+  // Two REAL orchestrators — each registered THEN authoritatively bound. The
+  // summary/profile are set too, but it is the bind (role='orchestrator') that
+  // earns the cross-repo exception now.
+  const oA = await register(url, 900031, {
+    git_root: REPO_A,
+    summary: "🐙 ORCH (CONV-10767) — repoA fleet",
+  });
+  await bindOrchestrator(url, oA);
+  const oB = await register(url, 900041, {
+    git_root: REPO_B,
+    profile: "🐙 Orchestrator",
+    summary: "coordinating repoB",
+  });
+  await bindOrchestrator(url, oB);
+  // The SPOOFER — carries BOTH peer-settable orchestrator signals (summary tag +
+  // iTerm profile) but is deliberately NEVER bound, so role=''. Under the old
+  // summary-prefix wall this row would have inherited the orchestrators-room
+  // exception; under the bound-role wall it must not.
+  const sA = await register(url, 900051, {
+    git_root: REPO_A,
+    profile: "🐙 Orchestrator",
+    summary: "🐙 ORCH (CONV-10767) — SPOOFER, never bound",
+  });
+  return { pA1, pA2, pB1, oA, oB, sA };
 }
 
 async function send(url: string, from_id: string, to_id: string, text: string) {
@@ -188,10 +217,20 @@ const MATRIX: Cell[] = [
   { from: "pA1", to: "oA", allow: true, label: "peer→own-repo orch" },
   { from: "pA1", to: "pB1", allow: false, label: "cross-repo peer→peer" },
   { from: "pA1", to: "oB", allow: false, label: "peer→other-repo orch" },
-  { from: "oA", to: "oB", allow: true, label: "orch↔orch (orchestrators room)" },
+  { from: "oA", to: "oB", allow: true, label: "BOUND orch↔orch (orchestrators room)" },
   { from: "oA", to: "pA1", allow: true, label: "orch→own-repo peer" },
   { from: "oA", to: "pB1", allow: false, label: "orch→other-repo peer" },
   { from: "oB", to: "pA1", allow: false, label: "orch→other-repo peer (B→A)" },
+  // ── SPOOF REJECTION — the point of the bound-role wall ──────────────────────
+  // sA sets summary="🐙 ORCH" + the orchestrator profile but never bound, so
+  // role=''. It gets NO orchestrators-room exception: cross-repo to a real bound
+  // orch is REJECTED. (Under the old summary-prefix wall this would ALLOW.)
+  { from: "sA", to: "oB", allow: false, label: "SPOOF summary-only → bound orch (REJECTED)" },
+  // A bound orch reaching the spoofer cross-repo is also rejected — the spoofer
+  // is not a bound orch, so (orch AND orch) fails on the recipient side too.
+  { from: "oB", to: "sA", allow: false, label: "bound orch → SPOOF summary-only (REJECTED)" },
+  // The spoofer is still a normal same-repo peer: sA→pA1 (both repo A) ALLOWS.
+  { from: "sA", to: "pA1", allow: true, label: "spoofer→same-repo peer (still ALLOWED)" },
 ];
 
 // ── flag OFF (default) — byte-identical: every send delivers ─────────────────
