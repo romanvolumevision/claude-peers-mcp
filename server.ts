@@ -38,6 +38,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
+import { renderPeerBlock } from "./shared/peer_display";
 import { resolveProfileEnv } from "./shared/profile_env";
 import { paintTmuxWindowTitle } from "./shared/tmux_paint";
 import { shouldReRegister } from "./shared/reregister";
@@ -226,7 +227,11 @@ function refreshTabTitle(summary: string): void {
     }
     const channel = profileToChannel(resolveProfileEnv());
     const conv = readLastConv();
-    const peer = myId ?? undefined;
+    // D-0060: prefer the readable bare name token (GUPPI_PEER_NAME, e.g. "Uma")
+    // over the opaque id in the tab title — "🟢 · Uma · CONV-… · topic" instead
+    // of "🟢 · 8n9aqm28 · …". Falls back to the opaque id when unset, so a
+    // hand-opened tab is unchanged. Routing + the pid-keyed marker still use myId.
+    const peer = myPeerName || myId || undefined;
     // CONV-10613 three-field rename — kept in parity with the GUPPI daemon
     // paint path (scripts/iterm/tab_title.py + guppi-daemon.py). The OLD code
     // fed the raw `summary` as the title label, double-painting the
@@ -418,6 +423,19 @@ let myProfile = "";
 // Host (client app) + machine — constant per process; detected once.
 const myHost = detectHost();
 const myMachine = detectMachine();
+// D-0060 readable identity (CONV-10767) — DISPLAY-ONLY, never a routing key.
+// Composed Python-side by the GUPPI orchestrator spawn assigner (peer_names.py:
+// compose_peer_name / peer_id_slug / next_name) and injected into this session's
+// env; here we only TRANSPORT the pre-composed strings — TS never re-implements
+// the grammar. All default '' → a session launched without them (a hand-opened
+// tab, or before the orchestrator assigner is wired) is byte-identical to today.
+//   GUPPI_PEER_LABEL — full readable label, e.g. "🟢 Green · P1 · Uma — offplan".
+//   GUPPI_PEER_SLUG  — deterministic short handle, e.g. "offplan-g1-uma".
+//   GUPPI_PEER_NAME  — the bare human handle ("Uma"); used only as the tab-title
+//                      token in place of the opaque id (routing stays on myId).
+const myDisplayName = process.env.GUPPI_PEER_LABEL ?? "";
+const mySlug = process.env.GUPPI_PEER_SLUG ?? "";
+const myPeerName = process.env.GUPPI_PEER_NAME ?? "";
 let mySummary = "";
 // Auto-summary refresh state. `summaryIsAuto` stays true only while the summary
 // is broker-generated; the first explicit set_summary tool call flips it false
@@ -564,6 +582,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (selfProfile) selfParts.push(`Profile: ${selfProfile}`);
         if (myHost) selfParts.push(`Host: ${myHost}`);
         if (myMachine) selfParts.push(`Machine: ${myMachine}`);
+        // D-0060 — surface this session's own readable name (display-only).
+        if (myDisplayName) selfParts.push(`Name: ${myDisplayName}`);
+        if (mySlug) selfParts.push(`Slug: ${mySlug}`);
         if (mySummary) selfParts.push(`Summary: ${mySummary}`);
         const selfLine = selfParts.join("\n  ");
 
@@ -578,21 +599,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
-        const lines = peers.map((p) => {
-          const parts = [
-            `ID: ${p.id}`,
-            `PID: ${p.pid}`,
-            `CWD: ${p.cwd}`,
-          ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
-          if (p.profile) parts.push(`Profile: ${p.profile}`);
-          if (p.host) parts.push(`Host: ${p.host}`);
-          if (p.machine) parts.push(`Machine: ${p.machine}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
-        });
+        // D-0060 (CONV-10767): per-peer block rendered by the extracted
+        // renderPeerBlock helper (shared/peer_display.ts) — identical field
+        // order/labels to before, plus an OPTIONAL `Name:`/`Slug:` line only
+        // when the peer carries one. Extracted so byte-identity is unit-tested.
+        const lines = peers.map(renderPeerBlock);
 
         return {
           content: [
@@ -741,6 +752,7 @@ async function pollAndPushMessages() {
       // Look up the sender's info for context
       let fromSummary = "";
       let fromCwd = "";
+      let fromDisplay = "";
       try {
         const peers = await brokerFetch<Peer[]>("/list-peers", {
           scope: "machine",
@@ -751,6 +763,9 @@ async function pollAndPushMessages() {
         if (sender) {
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
+          // D-0060: sender's readable name for display context only; the reply
+          // is still addressed by from_id (the opaque routing key).
+          fromDisplay = sender.display_name ?? "";
         }
       } catch {
         // Non-critical, proceed without sender info
@@ -763,6 +778,7 @@ async function pollAndPushMessages() {
           content: msg.text,
           meta: {
             from_id: msg.from_id,
+            from_display: fromDisplay,
             from_summary: fromSummary,
             from_cwd: fromCwd,
             sent_at: msg.sent_at,
@@ -796,6 +812,9 @@ async function reRegister(): Promise<void> {
       profile: myProfile,
       host: myHost,
       machine: myMachine,
+      // D-0060: re-present the same readable name so a re-register never blanks it.
+      display_name: myDisplayName,
+      slug: mySlug,
       summary: mySummary,
       // GBA-8: re-present the SAME boot_id so a live-PID re-register is
       // recognised as us (the broker's anti-hijack requires the echo to match).
@@ -880,6 +899,9 @@ async function main() {
     profile,
     host: myHost,
     machine: myMachine,
+    // D-0060: transport this session's pre-composed readable name (from env).
+    display_name: myDisplayName,
+    slug: mySlug,
     summary: initialSummary,
     // GBA-8: send this process's boot_id so the broker stores it and can later
     // require the echo to match (defeats the PID-spoof /register hijack).
