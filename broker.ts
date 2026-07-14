@@ -46,6 +46,8 @@ import type {
   KillPeerResponse,
   PollMessagesRequest,
   PollMessagesResponse,
+  BindOrchestratorRequest,
+  BindOrchestratorResponse,
   Peer,
   Message,
 } from "./shared/types.ts";
@@ -194,6 +196,17 @@ db.run(`
   if (!cols.some((c) => c.name === "session_id")) {
     db.run("ALTER TABLE peers ADD COLUMN session_id TEXT NOT NULL DEFAULT ''");
   }
+  // bind_orchestrator (CONV-10767) — strictly-additive `role` column via the same
+  // probe-then-ALTER idiom as host/machine/display_name/boot_id. NOT NULL DEFAULT
+  // '' → an old row (and every peer that never calls bind_orchestrator) reads ''
+  // = "no bound role", byte-identical to today. Set to "orchestrator" only by the
+  // bind_orchestrator self-op. This is the field repo_wall's isOrchestrator() and
+  // the future lease model key off — a BOUND role the server asserts, not a
+  // spoofable summary tag (see the PR's follow-on note). Unlike boot_id/repo_id it
+  // is non-secret, so it IS projected in PEER_COLUMNS below.
+  if (!cols.some((c) => c.name === "role")) {
+    db.run("ALTER TABLE peers ADD COLUMN role TEXT NOT NULL DEFAULT ''");
+  }
 }
 
 db.run(`
@@ -240,8 +253,13 @@ setInterval(cleanStalePeers, 30_000);
 // Peer-type fields, so they ARE projected here (default '' → the list_peers
 // render omits the Name/Slug line for an unlabeled peer, keeping its rendered
 // output byte-identical to pre-D-0060).
+// bind_orchestrator (CONV-10767) adds `role` here: it is a PUBLIC, non-secret
+// "who is the orchestrator" signal (like display_name/slug), so peers may see it
+// via /list-peers. It defaults '' (→ omitted from any render), keeping output
+// byte-identical for an unbound peer. token/boot_id/repo_id/session_id remain
+// OUT of this list (secret or off-contract — see the leak-regression tests).
 const PEER_COLUMNS =
-  "id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, summary, registered_at, last_seen";
+  "id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, role, summary, registered_at, last_seen";
 
 const insertPeer = db.prepare(`
   INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, summary, registered_at, last_seen, boot_id, token, repo_id, session_id)
@@ -714,6 +732,61 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- bind_orchestrator (CONV-10767) — authoritative orchestrator self-bind ---
+//
+// The keystone of the orchestrator-boot-hardening. A booting orchestrator used
+// to reconstruct its OWN peer id from ~6 scattered signals (env marker keyed by
+// a wrong pid → tty → sqlite lookup) — the source of the self-collision bug. But
+// the MCP server already knows its own id (`myId` — it created the row at
+// /register), so it binds SELF authoritatively here.
+//
+// `id` is the CALLER'S OWN id (server.ts injects its myId). The op sets
+// role="orchestrator", repo_id, boot_id on THAT row and echoes the peer id back.
+// It is idempotent — a re-bind updates in place. It binds exactly the row named
+// by `id` and nothing else; the MCP tool never lets a session name another id
+// (it exposes only {repo_id, boot_id}), so a session can only bind ITSELF. That
+// is the security property: identity is asserted by the server that owns the row.
+//
+// The written `role` column is what repo_wall's isOrchestrator() (which already
+// checks role==="orchestrator" first) and the future lease model read — a BOUND
+// role, not a spoofable summary tag. Wiring the wall's loadWallParticipant to
+// SELECT this column is a small, tested follow-on (see the PR body); here we only
+// ADD the column + the bind op, so this PR stays a clean substrate drop.
+//
+// boot_id: the value the caller asserts becomes the row's boot_id. In enforce
+// mode (dormant/default-off) that column is the GBA-789 anti-hijack echo anchor,
+// so a caller running under BROKER_IDENTITY_BIND_MODE=enforce should pass its own
+// process boot_id (server.ts sends the tool's boot_id argument). This PR ships
+// with the flag off, where the field is inert.
+type BindOrchestratorOutcome =
+  | { ok: true; response: BindOrchestratorResponse }
+  | { ok: false; status: number; error: string };
+
+function handleBindOrchestrator(body: BindOrchestratorRequest): BindOrchestratorOutcome {
+  const id = typeof body?.id === "string" ? body.id.trim() : "";
+  if (!id) {
+    // No self id on the body — the server always injects myId, so a blank id is a
+    // malformed request, never a silent no-op.
+    return { ok: false, status: 400, error: "bind_orchestrator requires the caller's own peer id" };
+  }
+  const repoId = typeof body.repo_id === "string" ? body.repo_id : "";
+  const bootId = typeof body.boot_id === "string" ? body.boot_id : "";
+
+  const existing = db.query("SELECT id FROM peers WHERE id = ?").get(id) as { id: string } | null;
+  if (!existing) {
+    // Unknown id → 404. Never INSERT — bind only ever mutates an existing,
+    // already-registered self row (no phantom rows).
+    return { ok: false, status: 404, error: `Peer ${id} not found` };
+  }
+
+  db.run("UPDATE peers SET role = 'orchestrator', repo_id = ?, boot_id = ? WHERE id = ?", [
+    repoId,
+    bootId,
+    id,
+  ]);
+  return { ok: true, response: { peer_id: id, repo_id: repoId, boot_id: bootId } };
+}
+
 // --- Phase 0 audit emit (aggregator-relay) ---
 //
 // broker.ts is dependency-free (stdlib only — node:crypto + bun:sqlite +
@@ -1064,6 +1137,18 @@ Bun.serve({
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
+        case "/bind-orchestrator": {
+          // bind_orchestrator (CONV-10767) — self-bind role/repo_id/boot_id. The
+          // `id` is the caller's own myId (server-injected); the op mutates only
+          // that row. Not wired into the identity-bind middleware (claimedActorId)
+          // in this PR — the self-only guarantee is provided at the MCP-tool layer
+          // (no target-id parameter); a lease-model authority check is the follow-on.
+          const outcome = handleBindOrchestrator(body as BindOrchestratorRequest);
+          if (!outcome.ok) {
+            return Response.json({ error: outcome.error }, { status: outcome.status });
+          }
+          return Response.json(outcome.response);
+        }
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

@@ -21,6 +21,13 @@ export interface Peer {
   //   slug         — deterministic short handle, e.g. "offplan-g1-uma".
   display_name: string;
   slug: string;
+  // bind_orchestrator (CONV-10767) — the peer's bound role. '' for a normal peer
+  // (and for any row that predates the migration); "orchestrator" once the peer
+  // has authoritatively bound itself via bind_orchestrator. PUBLIC + non-secret
+  // (unlike token/boot_id/repo_id) — it IS projected via /list-peers so peers can
+  // see who the orchestrator is; it is NEVER a routing key. Optional so an
+  // un-upgraded broker (or a synthetic Peer literal) that omits it is unaffected.
+  role?: string;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -126,4 +133,28 @@ export interface PollMessagesRequest {
 
 export interface PollMessagesResponse {
   messages: Message[];
+}
+
+// bind_orchestrator (CONV-10767) — the orchestrator-boot-hardening keystone.
+//
+// A booting orchestrator no longer reconstructs its own peer id from scattered
+// signals: the MCP server already knows its own id (it created the row at
+// /register), so it binds SELF authoritatively.
+//
+// `id` is the CALLER'S OWN id — server.ts injects its `myId`. It is NOT a
+// caller-chosen target: the MCP tool that fronts this op exposes only
+// {repo_id, boot_id} (no id parameter), so a session can bind ITSELF and nothing
+// else. That is the security property — identity is asserted by the server that
+// owns the row, not reconstructed or claimed.
+export interface BindOrchestratorRequest {
+  id: PeerId;
+  repo_id: string;
+  boot_id: string;
+}
+
+// The authoritative self peer id echoed back, plus the bound scope fields.
+export interface BindOrchestratorResponse {
+  peer_id: PeerId;
+  repo_id: string;
+  boot_id: string;
 }
