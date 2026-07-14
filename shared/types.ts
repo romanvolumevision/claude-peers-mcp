@@ -10,6 +10,17 @@ export interface Peer {
   profile: string; // iTerm2 dynamic-profile name (from ITERM_PROFILE env), "" if unset
   host: string; // client app hosting the session: "VS Code", "iTerm", "Terminal", "tmux", … ("" if undetected)
   machine: string; // physical machine: "MacBook", "Forge", … (GUPPI_SURFACE / hostname-derived; "" if undetected)
+  // D-0060 human-readable display fields (CONV-10767). DISPLAY-ONLY — never a
+  // routing key: the opaque `id` stays the sole FK across send/kill/heartbeat/
+  // set_summary and the GUPPI orch-lock holder_id. Both default '' so a peer
+  // that registers WITHOUT them (no GUPPI_PEER_LABEL in env) is byte-identical
+  // to today. The naming grammar lives ONCE in the GUPPI Python peer_names.py
+  // (compose_peer_name / peer_id_slug); the composed strings are injected into
+  // the session env and transported here VERBATIM — TS never re-implements it.
+  //   display_name — full readable label, e.g. "🟢 Green · P1 · Uma — offplan".
+  //   slug         — deterministic short handle, e.g. "offplan-g1-uma".
+  display_name: string;
+  slug: string;
   summary: string;
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
@@ -34,6 +45,11 @@ export interface RegisterRequest {
   profile: string;
   host?: string;
   machine?: string;
+  // D-0060 (CONV-10767) — optional, back-compat display fields. An un-upgraded
+  // server.ts omits them; the broker stores '' (byte-identical to today). Never
+  // a routing key — see the Peer-type note above.
+  display_name?: string;
+  slug?: string;
   summary: string;
   // S1 broker hardening (GBA-7/8/9) — all optional + backward-tolerant (an
   // un-upgraded server.ts omits them; the broker stores '' and the identity

@@ -139,6 +139,8 @@ db.run(`
     profile TEXT NOT NULL DEFAULT '',
     host TEXT NOT NULL DEFAULT '',
     machine TEXT NOT NULL DEFAULT '',
+    display_name TEXT NOT NULL DEFAULT '',
+    slug TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
@@ -157,6 +159,18 @@ db.run(`
   }
   if (!cols.some((c) => c.name === "machine")) {
     db.run("ALTER TABLE peers ADD COLUMN machine TEXT NOT NULL DEFAULT ''");
+  }
+  // D-0060 (CONV-10767) — human-readable display columns via the same
+  // probe-then-ALTER idiom as host/machine. Strictly additive, O(1) metadata-only
+  // ADD COLUMN (no row rewrite), old rows get '' (= "no readable name" → the
+  // list_peers render omits the Name/Slug line). PUBLIC, unlike `token` — they
+  // ARE projected in PEER_COLUMNS below so peers can see each other's readable
+  // names; they are NEVER a routing key.
+  if (!cols.some((c) => c.name === "display_name")) {
+    db.run("ALTER TABLE peers ADD COLUMN display_name TEXT NOT NULL DEFAULT ''");
+  }
+  if (!cols.some((c) => c.name === "slug")) {
+    db.run("ALTER TABLE peers ADD COLUMN slug TEXT NOT NULL DEFAULT ''");
   }
   // S1 broker hardening (GBA-7/8/9) — strictly-additive identity columns via the
   // same probe-then-ALTER idiom. NOT NULL DEFAULT '' matches the existing style:
@@ -222,13 +236,16 @@ setInterval(cleanStalePeers, 30_000);
 // peer's credential to every caller. Keeping it to exactly the Peer-type fields
 // also keeps /list-peers output byte-identical to pre-GBA789 (the new columns
 // are simply never projected). boot_id/repo_id/session_id are non-secret but
-// off-contract, so they are excluded too.
+// off-contract, so they are excluded too. D-0060 display_name/slug ARE public
+// Peer-type fields, so they ARE projected here (default '' → the list_peers
+// render omits the Name/Slug line for an unlabeled peer, keeping its rendered
+// output byte-identical to pre-D-0060).
 const PEER_COLUMNS =
-  "id, pid, cwd, git_root, tty, profile, host, machine, summary, registered_at, last_seen";
+  "id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, summary, registered_at, last_seen";
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, summary, registered_at, last_seen, boot_id, token, repo_id, session_id)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, pid, cwd, git_root, tty, profile, host, machine, display_name, slug, summary, registered_at, last_seen, boot_id, token, repo_id, session_id)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const updateLastSeen = db.prepare(`
@@ -325,6 +342,10 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
   const presentedBootId = body.boot_id ?? "";
   const repoId = body.repo_id ?? "";
   const sessionId = body.session_id ?? "";
+  // D-0060 display fields — default '' when the peer registers without them
+  // (byte-identical to today). Display-only; never consulted for routing.
+  const displayName = body.display_name ?? "";
+  const slug = body.slug ?? "";
 
   // Look up any existing registration for this PID.
   const existing = db
@@ -382,8 +403,11 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
       const token = existing.token !== "" ? existing.token : generatePeerToken();
       const bootId = existing.boot_id !== "" ? existing.boot_id : presentedBootId;
       // Refresh the mutable fields in place; KEEP the id.
+      // D-0060: refresh display_name/slug in place too so a re-register (or a
+      // broker blip that lands on the reuse path) never BLANKS a peer's readable
+      // name — the peer re-presents the same values it cached from its env.
       db.run(
-        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, summary = ?, last_seen = ?, token = ?, boot_id = ?, repo_id = ?, session_id = ? WHERE id = ?",
+        "UPDATE peers SET cwd = ?, git_root = ?, tty = ?, profile = ?, host = ?, machine = ?, display_name = ?, slug = ?, summary = ?, last_seen = ?, token = ?, boot_id = ?, repo_id = ?, session_id = ? WHERE id = ?",
         [
           body.cwd,
           body.git_root,
@@ -391,6 +415,8 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
           body.profile ?? "",
           body.host ?? "",
           body.machine ?? "",
+          displayName,
+          slug,
           body.summary,
           now,
           token,
@@ -422,6 +448,8 @@ function handleRegister(body: RegisterRequest, mode: IdentityBindMode): Register
     body.profile ?? "",
     body.host ?? "",
     body.machine ?? "",
+    displayName,
+    slug,
     body.summary,
     now,
     now,
