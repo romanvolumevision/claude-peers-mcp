@@ -39,7 +39,7 @@ import * as fs from "fs";
 import * as path from "path";
 import { stampPeerIdFile } from "./shared/stamp";
 import { composeCompactTitle, composeSessionName, composeBadge, profileToChannel } from "./shared/tabtitle";
-import { renderPeerBlock } from "./shared/peer_display";
+import { renderPeerBlock, readableIdentity, peerLabel } from "./shared/peer_display";
 import { resolveProfileEnv } from "./shared/profile_env";
 import { paintTmuxWindowTitle } from "./shared/tmux_paint";
 import { shouldReRegister } from "./shared/reregister";
@@ -619,8 +619,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         if (selfProfile) selfParts.push(`Profile: ${selfProfile}`);
         if (myHost) selfParts.push(`Host: ${myHost}`);
         if (myMachine) selfParts.push(`Machine: ${myMachine}`);
-        // D-0060 — surface this session's own readable name (display-only).
-        if (myDisplayName) selfParts.push(`Name: ${myDisplayName}`);
+        // D-0060 — surface this session's own readable name (display-only):
+        // the client-supplied display_name if set, else the broker-derived
+        // canonical identity (profile colour + repo), so YOU reads the same as
+        // how peers see this session.
+        const selfIdentity =
+          myDisplayName ||
+          readableIdentity({ profile: selfProfile, cwd: myCwd, git_root: myGitRoot });
+        if (selfIdentity) selfParts.push(`Name: ${selfIdentity}`);
         if (mySlug) selfParts.push(`Slug: ${mySlug}`);
         if (mySummary) selfParts.push(`Summary: ${mySummary}`);
         const selfLine = selfParts.join("\n  ");
@@ -748,9 +754,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
         }
-        const lines = result.messages.map(
-          (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
-        );
+        // D-0060: resolve each sender's readable identity for the "From …"
+        // header. Best-effort — a lookup failure or an unknown sender falls back
+        // to the opaque from_id (still routable). The raw id is kept in
+        // parentheses for debugging whenever a readable label is shown.
+        const senderById = new Map<string, Peer>();
+        try {
+          const senders = await brokerFetch<Peer[]>("/list-peers", {
+            scope: "machine",
+            cwd: myCwd,
+            git_root: myGitRoot,
+          });
+          for (const s of senders) senderById.set(s.id, s);
+        } catch {
+          // Non-critical — render with opaque ids.
+        }
+        const lines = result.messages.map((m) => {
+          const sender = senderById.get(m.from_id);
+          const label = sender ? peerLabel(sender) : "";
+          const who = label ? `${label} (${m.from_id})` : m.from_id;
+          return `From ${who} (${m.sent_at}):\n${m.text}`;
+        });
         return {
           content: [
             {
@@ -842,9 +866,11 @@ async function pollAndPushMessages() {
         if (sender) {
           fromSummary = sender.summary;
           fromCwd = sender.cwd;
-          // D-0060: sender's readable name for display context only; the reply
-          // is still addressed by from_id (the opaque routing key).
-          fromDisplay = sender.display_name ?? "";
+          // D-0060: sender's readable identity for the "── from … ──" header —
+          // the client-supplied display_name if set, else the broker-derived
+          // canonical identity (profile colour + repo). Display context only;
+          // the reply is still addressed by from_id (the opaque routing key).
+          fromDisplay = peerLabel(sender);
         }
       } catch {
         // Non-critical, proceed without sender info
