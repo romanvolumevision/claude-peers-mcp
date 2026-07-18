@@ -54,7 +54,10 @@ async function waitForBroker(url: string, timeoutMs = 5000): Promise<void> {
 
 function spawnBroker(): SpawnedBroker {
   const tmpDir = mkdtempSync(join(tmpdir(), "claude-peers-board49-"));
-  const port = 19900 + Math.floor(Math.random() * 90);
+  // Wide ephemeral range disjoint from sibling suites (identity_bind_client uses
+  // 19000-19899) so concurrent test FILES never collide, and the 20k-port pool
+  // makes an intra-file EADDRINUSE flake between the 3 sequential cases vanishing.
+  const port = 20000 + Math.floor(Math.random() * 20000);
   const dbPath = join(tmpDir, "peers.db");
   const proc = Bun.spawn(["bun", BROKER_SCRIPT], {
     env: {

@@ -461,7 +461,10 @@ const myPeerName = process.env.GUPPI_PEER_NAME ?? "";
 // caller binding from process-topology (pid) to session-identity (the #1185
 // path). `||` (NOT `??`) so an EMPTY env value falls through to the fallback and
 // then to '' — a peer launched without a session id stays byte-identical to a
-// pre-board-49 legacy row (the column's NOT NULL DEFAULT '').
+// pre-board-49 legacy row (the column's NOT NULL DEFAULT ''). SECURITY: like
+// boot_id/repo_id this is a client-ASSERTED value the broker stores as-is; it is
+// safe today only because nothing routes/authorises on it yet. Any future
+// enforcement MUST treat it as untrusted (boot_id already has the echo-check).
 const mySessionId =
   (process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "").trim();
 let mySummary = "";
