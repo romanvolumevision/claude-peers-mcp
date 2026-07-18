@@ -62,34 +62,37 @@ function makePeer(overrides: Partial<Peer> = {}): Peer {
   };
 }
 
-describe("D-0060 renderPeerBlock byte-identity (no display_name)", () => {
-  test("empty display_name/slug → byte-identical to the pre-D-0060 renderer", () => {
-    const p = makePeer({ display_name: "", slug: "" });
+describe("D-0060 renderPeerBlock byte-identity (nothing to derive)", () => {
+  // Post-readable-identity: an unlabeled peer now DERIVES a Name from its
+  // profile colour + repo. Byte-identity therefore holds only when there is
+  // ALSO nothing to derive from — i.e. no profile (profile: "") — which is the
+  // genuine "hand-opened tab / non-fleet session" case.
+  test("empty display_name/slug AND no profile → byte-identical to the pre-D-0060 renderer", () => {
+    const p = makePeer({ display_name: "", slug: "", profile: "" });
     expect(renderPeerBlock(p)).toBe(legacyRenderPeerBlock(p));
     expect(renderPeerBlock(p)).not.toContain("Name:");
     expect(renderPeerBlock(p)).not.toContain("Slug:");
   });
 
-  test("UNDEFINED display_name/slug (un-upgraded broker) → byte-identical, no Name line", () => {
+  test("UNDEFINED display_name/slug (un-upgraded broker) + no profile → byte-identical, no Name line", () => {
     // Simulate an old broker that returns Peer rows without the new fields.
-    const p = makePeer();
+    const p = makePeer({ profile: "" });
     delete (p as Partial<Peer>).display_name;
     delete (p as Partial<Peer>).slug;
     expect(renderPeerBlock(p)).toBe(legacyRenderPeerBlock(p));
     expect(renderPeerBlock(p)).not.toContain("Name:");
   });
 
-  test("byte-identity holds across the optional-field matrix (git_root/tty/profile/host/machine/summary absent)", () => {
+  test("byte-identity holds across the optional-field matrix (git_root/tty/host/machine/summary absent, no profile)", () => {
     const variants: Partial<Peer>[] = [
       { git_root: null },
       { tty: null },
-      { profile: "" },
       { host: "", machine: "" },
       { summary: "" },
-      { git_root: null, tty: null, profile: "", host: "", machine: "", summary: "" },
+      { git_root: null, tty: null, host: "", machine: "", summary: "" },
     ];
     for (const v of variants) {
-      const p = makePeer({ ...v, display_name: "", slug: "" });
+      const p = makePeer({ ...v, display_name: "", slug: "", profile: "" });
       expect(renderPeerBlock(p)).toBe(legacyRenderPeerBlock(p));
     }
   });
