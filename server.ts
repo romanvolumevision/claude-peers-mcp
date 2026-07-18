@@ -156,9 +156,14 @@ function log(msg: string) {
 //   * the GUPPI_PEER_ID env var on this process (visible to child shells), and
 //   * a pid-keyed marker file ~/.guppi/sessions/<pid>.peerid.
 //
-// Keyed by process.pid rather than a claude_session_id because no session-id
-// source exists in this MCP; pid is available everywhere the stamp is written
-// (server.ts self-register here, and broker.ts via body.pid).
+// The stamp MARKER FILE is keyed by process.pid (not the session id): pid is
+// what every stamp writer already has (server.ts self-register here, broker.ts
+// via body.pid) and what the pid-keyed marker path needs. NOTE (board-49,
+// CONV-11482): a session-id source DOES exist — Claude Code stamps
+// CLAUDE_CODE_SESSION_ID into this MCP subprocess env — and it now flows into the
+// /register body → the peers.session_id column (see mySessionId). That is the
+// session-identity key for caller binding (#1185); the marker-file keying above
+// is a separate concern and is intentionally left pid-based.
 //
 // composeTabTitle / profileToChannel live in shared/tabtitle.ts (unit-testable
 // without booting the stdio MCP) and mirror scripts/iterm/tab_title.py.
@@ -449,6 +454,16 @@ const myMachine = detectMachine();
 const myDisplayName = process.env.GUPPI_PEER_LABEL ?? "";
 const mySlug = process.env.GUPPI_PEER_SLUG ?? "";
 const myPeerName = process.env.GUPPI_PEER_NAME ?? "";
+// board-49 (CONV-11482): session-identity key. Claude Code stamps
+// CLAUDE_CODE_SESSION_ID into every MCP subprocess env (verified present across
+// all live server.ts processes), with a CLAUDE_SESSION_ID legacy fallback. Sent
+// in the /register BODY so the broker stores it on the peer row — upgrading
+// caller binding from process-topology (pid) to session-identity (the #1185
+// path). `||` (NOT `??`) so an EMPTY env value falls through to the fallback and
+// then to '' — a peer launched without a session id stays byte-identical to a
+// pre-board-49 legacy row (the column's NOT NULL DEFAULT '').
+const mySessionId =
+  (process.env.CLAUDE_CODE_SESSION_ID || process.env.CLAUDE_SESSION_ID || "").trim();
 let mySummary = "";
 // Auto-summary refresh state. `summaryIsAuto` stays true only while the summary
 // is broker-generated; the first explicit set_summary tool call flips it false
@@ -927,6 +942,9 @@ async function reRegister(): Promise<void> {
       // GBA-8: re-present the SAME boot_id so a live-PID re-register is
       // recognised as us (the broker's anti-hijack requires the echo to match).
       boot_id: myBootId,
+      // board-49 (CONV-11482): re-present the session id on the post-broker-blip
+      // re-register so a restored row never blanks it (matches boot_id/repo_root).
+      session_id: mySessionId,
     });
     const prev = myId;
     myId = reg.id;
@@ -1019,6 +1037,9 @@ async function main() {
     // GBA-8: send this process's boot_id so the broker stores it and can later
     // require the echo to match (defeats the PID-spoof /register hijack).
     boot_id: myBootId,
+    // board-49 (CONV-11482): send this session's id so the broker stores it on
+    // the peer row (was always '' — the client never sent it). '' when unset.
+    session_id: mySessionId,
   });
   myId = reg.id;
   // GBA-9: capture the minted scope-token; brokerFetch echoes it on every
