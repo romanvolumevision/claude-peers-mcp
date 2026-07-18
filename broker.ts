@@ -81,6 +81,8 @@ import {
   wallAllows,
   walledSendContext,
 } from "./shared/repo_wall";
+// board-10 / #3567 long-poll (CONV-11507) — per-peer wake fan-out + hold clamp.
+import { WaiterRegistry, clampWaitMs, type Waiter } from "./shared/longpoll";
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BIND_HOST = process.env.CLAUDE_PEERS_BIND_HOST ?? "127.0.0.1";
@@ -93,6 +95,13 @@ const HMAC_MODE: HmacMode = ((): HmacMode => {
 })();
 const AGGREGATOR_RELAY_URL =
   process.env.GUPPI_BROKER_AUDIT_RELAY_URL ?? "http://127.0.0.1:7901/broker-audit-relay";
+
+// board-10 / #3567 long-poll (CONV-11507) — the hard ceiling on how long the
+// broker will HOLD an empty /poll-messages open (the client requests a wait_ms,
+// which is clamped to this). Bounded so a hold always releases (gate 3 — no
+// held-forever, no connection leak). Overridable for tests / tuning; defaults
+// to 25s (well under any HTTP client idle timeout).
+const MAX_HOLD_MS = parseInt(process.env.CLAUDE_PEERS_LONGPOLL_MAX_MS ?? "25000", 10);
 
 // S1 broker hardening (GBA-7/8/9) — per-peer identity binding. Three-state,
 // DEFAULT OFF (mirrors BROKER_HMAC_MODE). off = byte-identical to today; warn =
@@ -339,6 +348,12 @@ const selectUndelivered = db.prepare(`
 const markDelivered = db.prepare(`
   UPDATE messages SET delivered = 1 WHERE id = ?
 `);
+
+// board-10 / #3567 long-poll (CONV-11507) — held /poll-messages waiters, keyed
+// by recipient peer id. handleSendMessage.wake(to_id) resolves ONLY that
+// recipient's holds (gate 2 — no thundering herd); a completed hold deregisters
+// itself so idle peers leave no residue (gate 3 — no leak).
+const pollWaiters = new WaiterRegistry();
 
 // --- Generate peer ID ---
 
@@ -628,6 +643,12 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   }
 
   insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  // board-10 / #3567 (CONV-11507): the DB write above is committed (synchronous)
+  // BEFORE we wake, so any held poll for this recipient re-drains and SEES this
+  // row. Waking ONLY body.to_id's waiters keeps delivery targeted (gate 2). A
+  // recipient with no held poll (between polls / on interval fallback) is a
+  // no-op wake — it drains on its next poll.
+  pollWaiters.wake(body.to_id);
   return { ok: true };
 }
 
@@ -803,15 +824,91 @@ function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
   return { ok: true, pid: peer.pid };
 }
 
-function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
-  const messages = selectUndelivered.all(body.id) as Message[];
+// board-10 / #3567 long-poll (CONV-11507). Hold an empty poll open until an
+// insert for this peer wakes it, a bounded timeout elapses, or the client
+// disconnects — turning delivery from "next 1s poll" into "near-instant" while
+// cutting idle poll load (one held connection vs a poll every second).
+// Backward-compatible: wait_ms<=0 / absent → no hold (immediate return, no
+// long_poll flag) so an OLD client is byte-identical to the pre-long-poll broker.
+async function handlePollMessages(
+  body: PollMessagesRequest,
+  signal?: AbortSignal,
+): Promise<PollMessagesResponse> {
+  // drain = select-then-mark, SYNCHRONOUS (no await between the select and the
+  // marks) so two concurrent polls for one peer can never double-deliver a row.
+  const drain = (): Message[] => {
+    const rows = selectUndelivered.all(body.id) as Message[];
+    for (const msg of rows) markDelivered.run(msg.id);
+    return rows;
+  };
 
-  // Mark them as delivered
-  for (const msg of messages) {
-    markDelivered.run(msg.id);
+  const waitMs = clampWaitMs(body.wait_ms, MAX_HOLD_MS);
+  const longPoll = waitMs > 0;
+
+  const messages = drain();
+  if (messages.length > 0 || !longPoll) {
+    // Fast path: queued messages, OR an old-client poll that must not be held.
+    return longPoll ? { messages, long_poll: true } : { messages };
   }
 
-  return { messages };
+  // Hold until a message for this peer, the deadline, or the client
+  // disconnecting. Each cycle registers a waiter and then RE-DRAINS — draining
+  // (select-then-mark) is the SINGLE source of truth, so the gap-close check and
+  // the loop's progress use the SAME predicate (Sol red-team round 2). Two
+  // concurrent polls for the SAME peer share one waiter Set, so one insert wakes
+  // BOTH; whichever's re-drain claims the row returns it, and the loser — seeing
+  // an empty drain (the row is now delivered, never re-seen) — re-holds for the
+  // REMAINING deadline rather than returning a spurious empty or busy-spinning.
+  // Total hold stays bounded by `deadline`.
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0 || signal?.aborted) return { messages: [], long_poll: true };
+
+    // One hold cycle. Resolves with the claimed rows (an insert we won), or null
+    // (a wake we lost the race for, this cycle's timeout, or an abort) → the loop
+    // re-checks the deadline and otherwise re-holds. `finish` is idempotent so a
+    // wake/timeout/abort race is safe.
+    const claimed = await new Promise<Message[] | null>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout>;
+      function finish(result: Message[] | null): void {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal) signal.removeEventListener("abort", onAbort);
+        pollWaiters.deregister(body.id, waiter);
+        resolve(result);
+      }
+      const onAbort = (): void => finish(null);
+      // A wake CLAIMS at wake-time (drain()) rather than signalling null, so a
+      // genuine wake is never discarded by the loop-top deadline check when the
+      // insert lands microseconds before the deadline (Sol red-team round 3 —
+      // woken-but-report-empty). `null` then uniquely means timeout/abort.
+      const waiter: Waiter = { resolve: () => finish(drain()) };
+      timer = setTimeout(() => finish(null), remaining);
+      // Gate 1 (no-insert-dropped): register the waiter BEFORE the re-drain. An
+      // insert landing between the last drain and here fired wake() with no
+      // waiter — the re-drain below claims it. An insert after register fires our
+      // wake. Combined with insert-happens-before-wake in handleSendMessage, no
+      // window can both hide the row AND miss the wake.
+      pollWaiters.register(body.id, waiter);
+      const rows = drain();
+      if (rows.length > 0) {
+        finish(rows);
+        return;
+      }
+      if (signal) {
+        if (signal.aborted) {
+          finish(null);
+          return;
+        }
+        signal.addEventListener("abort", onAbort);
+      }
+    });
+
+    if (claimed && claimed.length > 0) return { messages: claimed, long_poll: true };
+  }
 }
 
 function handleUnregister(body: { id: string }): void {
@@ -1219,7 +1316,9 @@ Bun.serve({
         case "/kill-peer":
           return Response.json(handleKillPeer(body as KillPeerRequest));
         case "/poll-messages":
-          return Response.json(handlePollMessages(body as PollMessagesRequest));
+          // board-10 / #3567 (CONV-11507): await the long-poll hold. req.signal
+          // aborts on client disconnect so a dropped connection releases its hold.
+          return Response.json(await handlePollMessages(body as PollMessagesRequest, req.signal));
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });

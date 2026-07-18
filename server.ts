@@ -22,6 +22,7 @@ import {
 import type {
   PeerId,
   Peer,
+  Message,
   RegisterResponse,
   PollMessagesResponse,
   BindOrchestratorResponse,
@@ -31,6 +32,9 @@ import {
   getGitBranch,
   getRecentFiles,
 } from "./shared/summarize.ts";
+// board-10 / #3567 long-poll (CONV-11507) — client-side pacing (fallback belt)
+// + the once-per-drain peer-list hoist. Pure helpers, unit-tested separately.
+import { nextPollDelayMs, processInbound } from "./shared/longpoll.ts";
 
 // --- Configuration ---
 
@@ -65,6 +69,12 @@ const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
 const HMAC_SECRET = process.env.CLAUDE_PEERS_HMAC_SECRET ?? "";
 const POLL_INTERVAL_MS = 1000;
+// board-10 / #3567 long-poll (CONV-11507) — the max ms this client asks the
+// broker to HOLD an empty poll open (the broker clamps to its own ceiling). A
+// long-poll-capable broker holds up to this and returns near-instant on an
+// insert; POLL_INTERVAL_MS is the fallback floor when the broker doesn't
+// long-poll or errors. Default 25s; overridable for tuning.
+const LONGPOLL_WAIT_MS = parseInt(process.env.CLAUDE_PEERS_LONGPOLL_WAIT_MS ?? "25000", 10);
 const HEARTBEAT_INTERVAL_MS = 15_000;
 // Open-016 Phase 3d: the adapter no longer self-spawns a broker (launchd owns
 // it), so the broker script path is no longer needed here.
@@ -77,7 +87,11 @@ const HEARTBEAT_INTERVAL_MS = 15_000;
  * when env-var is unset (no headers added; broker accepts in warn mode,
  * rejects in enforce mode).
  */
-async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
+async function brokerFetch<T>(
+  path: string,
+  body: unknown,
+  opts?: { timeoutMs?: number },
+): Promise<T> {
   const bodyStr = JSON.stringify(body);
   const headers: Record<string, string> = { "Content-Type": "application/json" };
   if (HMAC_SECRET) {
@@ -100,6 +114,10 @@ async function brokerFetch<T>(path: string, body: unknown): Promise<T> {
     method: "POST",
     headers,
     body: bodyStr,
+    // board-10 / #3567 (CONV-11507): only the long-poll caller passes a timeout
+    // (wait_ms + margin) so a socket wedged mid-hold can't stall the poll loop
+    // forever. Every other caller omits it → no timeout, byte-identical to today.
+    ...(opts?.timeoutMs ? { signal: AbortSignal.timeout(opts.timeoutMs) } : {}),
   });
   if (!res.ok) {
     const err = await res.text();
@@ -861,59 +879,81 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
+// --- Long-poll loop for inbound messages (board-10 / #3567, CONV-11507) ---
+//
+// The OLD delivery path was poll-GATED only: a fixed 1s setInterval was the SOLE
+// trigger, so a queued message waited up to a full interval (~1s, avg ~500ms).
+// Now the client LONG-POLLS — it sends wait_ms so the broker HOLDS the request
+// open and returns near-instant on an insert. A self-rescheduling loop replaces
+// the setInterval: pacing (nextPollDelayMs) re-polls IMMEDIATELY when the broker
+// long-polled (continuous hold → near-zero lag) and falls back to the interval
+// floor otherwise — an OLD broker that doesn't set long_poll, OR any error — so
+// a broker that can't (or momentarily won't) long-poll can NEVER leave this peer
+// deaf (gate 4). Sender enrichment is hoisted to ONCE per drain (gate 5) via
+// processInbound instead of a /list-peers round-trip per message.
 
-async function pollAndPushMessages() {
-  if (!myId) return;
+let pollingActive = true;
 
+/** Push one inbound message to the session as a channel notification (the leg
+ * that surfaces it immediately). Sender context is best-effort — resolved from
+ * the once-per-drain peer list. */
+async function pushInboundMessage(msg: Message, sender: Peer | undefined): Promise<void> {
+  // D-0060: sender's readable identity for the "── from … ──" header — the
+  // client-supplied display_name if set, else the broker-derived canonical
+  // identity. Display context only; the reply is still addressed by from_id.
+  const fromSummary = sender?.summary ?? "";
+  const fromCwd = sender?.cwd ?? "";
+  const fromDisplay = sender ? peerLabel(sender) : "";
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content: msg.text,
+      meta: {
+        from_id: msg.from_id,
+        from_display: fromDisplay,
+        from_summary: fromSummary,
+        from_cwd: fromCwd,
+        sent_at: msg.sent_at,
+      },
+    },
+  });
+  log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+}
+
+/** One poll iteration. Returns the ms to wait before the NEXT poll (0 = re-poll
+ * immediately — the continuous long-poll). */
+async function pollOnce(): Promise<number> {
+  if (!myId) return POLL_INTERVAL_MS;
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
-
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
-      let fromSummary = "";
-      let fromCwd = "";
-      let fromDisplay = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-          // D-0060: sender's readable identity for the "── from … ──" header —
-          // the client-supplied display_name if set, else the broker-derived
-          // canonical identity (profile colour + repo). Display context only;
-          // the reply is still addressed by from_id (the opaque routing key).
-          fromDisplay = peerLabel(sender);
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
-
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_display: fromDisplay,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
-          },
-        },
-      });
-
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
-    }
+    const result = await brokerFetch<PollMessagesResponse>(
+      "/poll-messages",
+      { id: myId, wait_ms: LONGPOLL_WAIT_MS },
+      // Client-side belt: cap the socket at the hold + a margin so a wedged
+      // connection can't stall the loop forever (the broker releases at wait_ms).
+      { timeoutMs: LONGPOLL_WAIT_MS + 5000 },
+    );
+    // Gate 5: hoist /list-peers to once-per-drain (was one round-trip PER msg).
+    await processInbound(result.messages, {
+      fetchPeers: () =>
+        brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot }),
+      push: pushInboundMessage,
+    });
+    // Gate 4: long_poll:true → re-poll immediately; else interval floor.
+    return nextPollDelayMs(result, POLL_INTERVAL_MS);
   } catch (e) {
-    // Broker might be down temporarily, don't crash
+    // Broker down / long-poll unsupported / socket timeout — degrade to interval
+    // poll so a broker hiccup can NEVER leave this peer deaf (gate 4 belt).
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
+    return POLL_INTERVAL_MS;
+  }
+}
+
+/** The self-rescheduling poll loop (replaces the old fixed setInterval). */
+async function pollLoop(): Promise<void> {
+  while (pollingActive) {
+    const delay = await pollOnce();
+    if (!pollingActive) break;
+    if (delay > 0) await new Promise((r) => setTimeout(r, delay));
   }
 }
 
@@ -1111,8 +1151,11 @@ async function main() {
     }
   };
 
-  // 6. Start polling for inbound messages
-  const pollTimer = setInterval(pollAndPushMessages, POLL_INTERVAL_MS);
+  // 6. Start long-polling for inbound messages (board-10 / #3567, CONV-11507).
+  // A self-rescheduling loop (NOT a fixed setInterval): it holds each poll open
+  // broker-side and re-polls per nextPollDelayMs — near-instant delivery on a
+  // long-poll broker, interval fallback otherwise.
+  void pollLoop();
 
   // 7. Start heartbeat. Open-016 Phase 3b: the broker now reports whether it
   // still knows us; on `known: false` (broker restarted / forgot us) we
@@ -1166,7 +1209,7 @@ async function main() {
 
   // 8. Clean up on exit
   const cleanup = async () => {
-    clearInterval(pollTimer);
+    pollingActive = false; // board-10 / #3567: stop the long-poll loop
     clearInterval(heartbeatTimer);
     clearInterval(summaryRefreshTimer);
     if (myId) {
