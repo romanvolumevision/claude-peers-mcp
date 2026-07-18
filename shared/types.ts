@@ -142,10 +142,23 @@ export interface KillPeerResponse {
 
 export interface PollMessagesRequest {
   id: PeerId;
+  // board-10 / #3567 long-poll (CONV-11507) — the max ms the broker may HOLD an
+  // empty poll open before returning, waiting for an insert for this peer.
+  // Optional + backward-tolerant: an OLD client omits it → the broker does not
+  // hold (immediate return, byte-identical to the pre-long-poll broker); an OLD
+  // broker ignores it → the client sees no `long_poll` flag and falls back to
+  // interval polling. Broker-side clamped to [0, max]. Never a routing key.
+  wait_ms?: number;
 }
 
 export interface PollMessagesResponse {
   messages: Message[];
+  // board-10 / #3567 (CONV-11507) — set true ONLY by a long-poll-capable broker
+  // when the client opted in (sent a positive wait_ms). It is the client's
+  // capability signal: true → re-poll immediately (continuous long-poll); absent
+  // (an old broker, or a non-opted-in poll) → the client keeps its interval
+  // floor. Optional so an old broker that never sets it stays byte-compatible.
+  long_poll?: boolean;
 }
 
 // bind_orchestrator (CONV-10767) — the orchestrator-boot-hardening keystone.
