@@ -44,6 +44,7 @@ import type {
   SendMessageRequest,
   KillPeerRequest,
   KillPeerResponse,
+  KillDisposition,
   PollMessagesRequest,
   PollMessagesResponse,
   BindOrchestratorRequest,
@@ -58,6 +59,10 @@ import {
   buildRelayAuditHeaders,
 } from "./relay-audit";
 import { stampPeerIdFile } from "./shared/stamp";
+// board-272 / #2041: resolve the claude harness pid from the registered adapter
+// pid so /kill-peer signals the SESSION, not its MCP-adapter sibling.
+import { resolveHarnessPid } from "./shared/harness_resolve";
+import { psProcLookup } from "./shared/ps_lookup";
 import {
   BOOT_ID_HEADER,
   PEER_TOKEN_HEADER,
@@ -761,6 +766,16 @@ function dropPeer(id: string): void {
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
 }
 
+// board-272 / #2041: the registered pid is the MCP adapter (`bun server.ts`),
+// whose DIRECT parent is the `claude` harness — verified depth-1 for every live
+// adapter across the fleet (2026-07-24). Resolve the harness as the registered
+// pid's parent ONLY (maxDepth 1): this is both the correct production target and
+// the safety bound. A deeper walk could, on a non-adapter pid, climb to an
+// UNRELATED `claude` session (e.g. a test runner's own harness) and kill it —
+// so any topology that is not "adapter directly under its harness" degrades to a
+// LOUD sibling-only kill instead of signalling a mis-resolved pid.
+const HARNESS_RESOLVE_MAX_DEPTH = 1;
+
 function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
   const peer = db.query("SELECT id, pid FROM peers WHERE id = ?").get(body.to_id) as
     | { id: string; pid: number }
@@ -773,55 +788,111 @@ function handleKillPeer(body: KillPeerRequest): KillPeerResponse {
     return { ok: false, error: `Unsupported signal ${signal} (allowed: SIGTERM, SIGKILL, SIGINT)` };
   }
   const actor = body.from_id ?? null;
+  const registeredPid = peer.pid;
+
+  // Resolve the harness. null → no `claude` parent → sibling-only degrade.
+  const harness = resolveHarnessPid(registeredPid, psProcLookup, HARNESS_RESOLVE_MAX_DEPTH);
+  const targetPid = harness ? harness.pid : registeredPid;
+  const disposition: KillDisposition = harness ? "session" : "sibling_only";
+
   try {
-    process.kill(peer.pid, signal as NodeJS.Signals);
+    // Signal the target: the harness on a session kill (the tab dies), else the
+    // registered adapter (sibling-only).
+    process.kill(targetPid, signal as NodeJS.Signals);
   } catch (e) {
     const code = (e as { code?: string })?.code;
     if (code === "ESRCH") {
-      // Process is already gone — clean up the stale row and report success.
+      // Target already gone — clean up the stale row and report success. ESRCH
+      // means no signal was delivered, so this is neither a session nor a
+      // sibling kill: record it as `stale` so audit never implies a live
+      // process was terminated. Never-raise (emitAudit is fire-and-forget).
       dropPeer(peer.id);
-      // A5 (Open-016, CONV-10639): mirror the Python guppi-mcp
-      // kill_peer_dispatched envelope so a destructive cross-tier kill is at
-      // least as observable as a keystroke. ESRCH = no signal actually
-      // delivered; record the stale-clean outcome so audit doesn't imply a
-      // live process was terminated. Never-raise (emitAudit is fire-and-forget).
       emitAudit("kill_peer_dispatched", {
         actor,
         target_peer_id: peer.id,
-        target_pid: peer.pid,
+        target_pid: targetPid,
+        registered_pid: registeredPid,
+        harness_pid: harness?.pid ?? null,
         signal,
         result: "esrch_stale_cleaned",
+        disposition: "stale",
       });
-      return { ok: true, pid: peer.pid, error: "process already exited (stale peer cleaned)" };
+      return {
+        ok: true,
+        pid: targetPid,
+        killed: "stale",
+        registered_pid: registeredPid,
+        harness_pid: harness?.pid,
+        error: "process already exited (stale peer cleaned)",
+        note: `target pid ${targetPid} already exited; stale peer row cleaned.`,
+      };
     }
     emitAudit("kill_peer_dispatched", {
       actor,
       target_peer_id: peer.id,
-      target_pid: peer.pid,
+      target_pid: targetPid,
+      registered_pid: registeredPid,
+      harness_pid: harness?.pid ?? null,
       signal,
       result: "error",
+      disposition,
       detail: e instanceof Error ? e.message : String(e),
     });
     return {
       ok: false,
-      error: `kill(${peer.pid}, ${signal}) failed: ${e instanceof Error ? e.message : String(e)}`,
+      error: `kill(${targetPid}, ${signal}) failed: ${e instanceof Error ? e.message : String(e)}`,
+      killed: disposition,
+      registered_pid: registeredPid,
+      harness_pid: harness?.pid,
     };
   }
+
+  // On a session kill, ALSO signal the registered adapter so it can't orphan and
+  // re-register as a fresh zombie row. Best-effort: an ESRCH here (the adapter
+  // already reaped via the harness teardown / stdin-EOF) is expected and inert.
+  if (harness && registeredPid !== targetPid) {
+    try {
+      process.kill(registeredPid, signal as NodeJS.Signals);
+    } catch {
+      /* adapter already gone — fine */
+    }
+  }
+
   // Drop the peer so it disappears from list-peers immediately; the target's
   // own SIGTERM handler also calls /unregister (a no-op if we win the race).
   dropPeer(peer.id);
-  console.error(`[claude-peers broker] kill ${peer.id} (pid ${peer.pid}, ${signal}) by ${actor ?? "?"}`);
-  // A5: action-level audit envelope for the successful kill dispatch. This is
-  // the irreversible, cross-tier branch — the one that most needs to be at
-  // least as observable as a keystroke. Fire-and-forget; never blocks/raises.
+  const note =
+    disposition === "session"
+      ? `session kill: signalled claude harness pid ${harness!.pid} (${signal}) + adapter pid ${registeredPid}.`
+      : `SIBLING-ONLY KILL: no claude harness parent resolved from adapter pid ${registeredPid}; ` +
+        `signalled the MCP adapter only — THE SESSION TAB LIKELY SURVIVES and must be killed ` +
+        `manually (tty-verified). board-272/#2041.`;
+  console.error(
+    `[claude-peers broker] kill ${peer.id} disposition=${disposition} target=${targetPid} ` +
+      `registered=${registeredPid} (${signal}) by ${actor ?? "?"}`,
+  );
+  // A5 (Open-016, CONV-10639): action-level audit envelope for the kill
+  // dispatch — the irreversible cross-tier branch. Now carries the disposition
+  // + both pids so the trail distinguishes a real session kill from a
+  // sibling-only one. Fire-and-forget; never blocks/raises.
   emitAudit("kill_peer_dispatched", {
     actor,
     target_peer_id: peer.id,
-    target_pid: peer.pid,
+    target_pid: targetPid,
+    registered_pid: registeredPid,
+    harness_pid: harness?.pid ?? null,
     signal,
     result: "ok",
+    disposition,
   });
-  return { ok: true, pid: peer.pid };
+  return {
+    ok: true,
+    pid: targetPid,
+    killed: disposition,
+    harness_pid: harness?.pid,
+    registered_pid: registeredPid,
+    note,
+  };
 }
 
 // board-10 / #3567 long-poll (CONV-11507). Hold an empty poll open until an
