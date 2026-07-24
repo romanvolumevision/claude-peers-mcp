@@ -134,10 +134,26 @@ export interface KillPeerRequest {
   signal?: "SIGTERM" | "SIGKILL" | "SIGINT";
 }
 
+// board-272 / #2041: the disposition of a kill. `session` = the claude harness
+// pid was resolved (via the registered adapter's PPID chain) and signalled — the
+// tab actually dies. `sibling_only` = NO claude ancestor resolved, so only the
+// registered MCP-adapter pid was signalled and the SESSION LIKELY SURVIVES (the
+// caller must not treat this as a session death). `stale` = the registered pid
+// was already gone (ESRCH) and the row was cleaned.
+export type KillDisposition = "session" | "sibling_only" | "stale";
+
 export interface KillPeerResponse {
   ok: boolean;
   error?: string;
+  // The pid actually signalled: the harness pid on a `session` kill, else the
+  // registered adapter pid. Kept as the primary field for backward compatibility.
   pid?: number;
+  // board-272 / #2041 — LOUD kill provenance so a caller can never mistake a
+  // sibling kill for a session kill. All optional → an old client ignores them.
+  killed?: KillDisposition;
+  harness_pid?: number; // resolved claude harness pid (present iff killed === "session")
+  registered_pid?: number; // the broker-row pid = the MCP adapter sibling
+  note?: string; // human-readable; LOUD on `sibling_only`
 }
 
 export interface PollMessagesRequest {
